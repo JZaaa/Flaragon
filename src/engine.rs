@@ -1,0 +1,1662 @@
+use crate::{
+    Context, Result, bail,
+    config::*,
+    discovery, ensure,
+    platform::{self, Identity, Process},
+    protocol, service_config,
+};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    net::{Ipv4Addr, TcpListener},
+    path::{Path, PathBuf},
+    thread,
+    time::{Duration, Instant},
+};
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Row {
+    pub id: String,
+    pub title: String,
+    pub state: String,
+    pub ports: String,
+    pub detail: String,
+    pub running: bool,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct Record {
+    id: String,
+    kind: Kind,
+    identity: Identity,
+    ports: Vec<u16>,
+    config: PathBuf,
+}
+struct Running {
+    record: Record,
+    process: Process,
+}
+#[derive(Serialize, Deserialize)]
+struct RuntimeState {
+    records: Vec<Record>,
+    token: String,
+    applied: Option<Config>,
+    #[serde(default)]
+    applied_files: BTreeMap<PathBuf, Vec<u8>>,
+}
+#[derive(Clone, Serialize)]
+pub struct Snapshot {
+    pub addresses: Vec<String>,
+    pub config: Config,
+    pub packages: Vec<Package>,
+    pub rows: Vec<Row>,
+    pub applied_revision: Option<u64>,
+    pub message: String,
+}
+pub struct Engine {
+    pub layout: Layout,
+    pub config: Config,
+    pub packages: Vec<Package>,
+    running: BTreeMap<String, Vec<Running>>,
+    pub message: String,
+    errors: BTreeMap<String, String>,
+    applied: Option<Config>,
+    applied_files: BTreeMap<PathBuf, Vec<u8>>,
+    token: String,
+    discovery_cache: discovery::Cache,
+    addresses: Vec<String>,
+}
+impl Engine {
+    pub fn running_ids(&self) -> Vec<String> {
+        self.running
+            .iter()
+            .filter(|(_, entries)| entries.iter().any(|p| p.process.running()))
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+    pub fn inspect_mysql(&self, spec: &MysqlSpec) -> Result<bool> {
+        let package = self.package(&spec.package, Kind::Mysql)?;
+        ensure!(
+            mysql_series(&package.version)? == spec.series,
+            "MySQL 组件与数据目录版本不匹配"
+        );
+        let dir = spec.data_path(&self.layout)?;
+        let marker = spec.binding_path(&self.layout)?;
+        if marker.exists() {
+            let binding: String = serde_json::from_slice(&fs::read(marker)?)?;
+            ensure!(
+                binding == format!("{}:{}", spec.package, package.version),
+                "数据目录绑定其他 MySQL 构建，不能自动升级或降级"
+            );
+            ensure!(
+                self.layout.path(dir.join("mysql"))?.is_dir(),
+                "历史数据目录不完整，拒绝重新初始化"
+            );
+        } else if dir.exists() {
+            ensure!(
+                dir.is_dir() && fs::read_dir(&dir)?.next().is_none(),
+                "数据目录已存在但无法确认版本，禁止使用或覆盖"
+            );
+        }
+        Ok(dir.exists())
+    }
+    fn validate_settings(&self, candidate: &Config) -> Result<()> {
+        self.config
+            .validate_settings_change(candidate, &self.running_ids())?;
+        for spec in &candidate.mysql {
+            let old = self.config.mysql.iter().find(|old| old.id == spec.id);
+            if old.is_none_or(|old| {
+                old.name != spec.name || old.series != spec.series || old.package != spec.package
+            }) {
+                let exists = self.inspect_mysql(spec)?;
+                ensure!(
+                    !exists || spec.reuse_data,
+                    "数据目录已存在，请确认使用历史数据：{}",
+                    spec.data_path(&self.layout)?.display()
+                );
+            }
+        }
+        Ok(())
+    }
+    pub fn apply_settings(&mut self, mut candidate: Config) -> Result<()> {
+        candidate.validate(&self.layout)?;
+        self.validate_settings(&candidate)?;
+        ensure!(
+            serde_json::to_value(&candidate.projects)?
+                == serde_json::to_value(&self.config.projects)?,
+            "请通过项目页面修改项目"
+        );
+        let old = self.config.clone();
+        candidate.revision = old.revision.checked_add(1).context("配置版本号超出范围")?;
+        let changed: Vec<_> = self
+            .service_ids_for(&candidate)
+            .into_iter()
+            .filter(|id| {
+                if id == "apache" {
+                    old.apache != candidate.apache
+                        || old.http_port != candidate.http_port
+                        || old.http_address != candidate.http_address
+                        || old
+                            .php
+                            .iter()
+                            .map(|p| (&p.package, &p.directory_entry))
+                            .collect::<Vec<_>>()
+                            != candidate
+                                .php
+                                .iter()
+                                .map(|p| (&p.package, &p.directory_entry))
+                                .collect::<Vec<_>>()
+                        || old.default_php != candidate.default_php
+                } else if id == "redis" {
+                    old.redis != candidate.redis
+                } else if let Some(p) = id.strip_prefix("php:") {
+                    old.php.iter().find(|s| s.package == p)
+                        != candidate.php.iter().find(|s| s.package == p)
+                } else {
+                    let name = id.trim_start_matches("mysql:");
+                    old.mysql.iter().find(|s| s.id == name)
+                        != candidate.mysql.iter().find(|s| s.id == name)
+                }
+            })
+            .collect();
+        let mut files = BTreeMap::new();
+        for id in &changed {
+            files.extend(service_config::snapshot(&self.layout, id)?);
+        }
+        self.config = candidate;
+        let result: Result<()> = (|| {
+            self.ensure_overrides()?;
+            let prepared = changed
+                .iter()
+                .filter(|id| {
+                    self.config
+                        .service_usage(id)
+                        .is_ok_and(|u| u != ServiceUsage::Disabled)
+                })
+                .map(|id| self.service_candidate(id).map(|path| (id, path)))
+                .collect::<Result<Vec<_>>>()?;
+            atomic_write(
+                &self.layout.path("config/app.backup.json")?,
+                &serde_json::to_vec_pretty(&old)?,
+            )?;
+            for (id, path) in prepared {
+                service_config::commit(&self.layout, id, &path)?;
+            }
+            self.layout.save(&self.config)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.config = old;
+            let mut errors = Vec::new();
+            for (path, bytes) in files {
+                if let Err(e) = atomic_write(&path, &bytes) {
+                    errors.push(e.to_string());
+                }
+            }
+            bail!(
+                "设置未保存：{error:#}；恢复结果：{}",
+                if errors.is_empty() {
+                    "已恢复".into()
+                } else {
+                    errors.join("；")
+                }
+            );
+        }
+        self.message = "环境设置已保存；运行中的服务保持运行".into();
+        self.persist()?;
+        Ok(())
+    }
+    fn service_ids_for(&self, config: &Config) -> Vec<String> {
+        let mut ids = Vec::new();
+        if config.apache.is_some() {
+            ids.push("apache".into());
+        }
+        ids.extend(config.php.iter().map(|s| format!("php:{}", s.package)));
+        ids.extend(config.mysql.iter().map(|s| format!("mysql:{}", s.id)));
+        if config.redis.is_some() {
+            ids.push("redis".into());
+        }
+        ids
+    }
+    pub fn new(layout: Layout) -> Result<Self> {
+        let paths = crate::relocation::check(&layout)?;
+        let config = layout.load()?;
+        let mut engine = Self {
+            layout,
+            config,
+            packages: vec![],
+            running: BTreeMap::new(),
+            message: paths.message(),
+            errors: BTreeMap::new(),
+            applied: None,
+            applied_files: BTreeMap::new(),
+            token: platform::random_token()?,
+            discovery_cache: discovery::Cache::default(),
+            addresses: platform::local_ipv4_addresses()?,
+        };
+        engine.recover()?;
+        Ok(engine)
+    }
+    pub fn scan(&mut self) -> Result<()> {
+        self.addresses = platform::local_ipv4_addresses()?;
+        self.packages = discovery::scan_cached(&self.layout, &mut self.discovery_cache)?;
+        let mut config = self.config.clone();
+        for p in self.packages.iter().filter(|p| p.error.is_none()) {
+            match p.kind {
+                Kind::Apache => {
+                    if config.apache.is_none() {
+                        config.apache = Some(p.id.clone());
+                    }
+                }
+                Kind::Php => {
+                    if config.default_php.is_none() {
+                        config.default_php = Some(p.id.clone());
+                    }
+                    if !config.php.iter().any(|s| s.package == p.id) {
+                        config.php.push(PhpSpec {
+                            package: p.id.clone(),
+                            port: next_port(&config, 19000, 2)?,
+                            workers: 2,
+                            usage: ServiceUsage::Normal,
+                            directory_entry: DirectoryEntry::default(),
+                        });
+                    }
+                }
+                Kind::Mysql => {}
+                Kind::Redis => {
+                    if config.redis.is_none() {
+                        config.redis = Some(RedisSpec {
+                            package: p.id.clone(),
+                            port: next_port(&config, 6379, 1)?,
+                            usage: ServiceUsage::Normal,
+                        });
+                    }
+                }
+            }
+        }
+        self.layout.save(&config)?;
+        self.config = config;
+        self.ensure_overrides()?;
+        self.message = format!(
+            "识别 {} 个组件；异常 {} 个",
+            self.packages.len(),
+            self.packages.iter().filter(|p| p.error.is_some()).count()
+        );
+        Ok(())
+    }
+    fn package(&self, id: &str, kind: Kind) -> Result<&Package> {
+        let p = self
+            .packages
+            .iter()
+            .find(|p| p.id == id && p.kind == kind)
+            .with_context(|| format!("组件不存在，请刷新：{id}"))?;
+        ensure!(
+            p.error.is_none(),
+            "组件不可用：{}",
+            p.error.as_deref().unwrap_or_default()
+        );
+        self.layout.path(&p.executable)?;
+        self.layout.path(&p.directory)?;
+        Ok(p)
+    }
+    fn ensure_overrides(&self) -> Result<()> {
+        for php in &self.config.php {
+            let file = self.layout.php_ini(&php.package)?;
+            if !file.exists() {
+                atomic_write(&file,b"; PHP settings: memory_limit, upload_max_filesize, post_max_size, max_execution_time, date.timezone, display_errors, error_reporting, extension\nmemory_limit = 256M\nupload_max_filesize = 32M\npost_max_size = 40M\ndate.timezone = Asia/Shanghai\ndisplay_errors = On\nerror_reporting = E_ALL\n")?;
+            }
+        }
+        for mysql in &self.config.mysql {
+            let file = self
+                .layout
+                .path(format!("config/overrides/mysql/{}.ini", mysql.id))?;
+            if !file.exists() {
+                atomic_write(&file,b"# MySQL settings: max_connections, innodb_buffer_pool_size, sql_mode, wait_timeout\nmax_connections=100\ninnodb_buffer_pool_size=64M\n")?;
+            }
+        }
+        let redis = self.layout.path("config/overrides/redis.conf")?;
+        if !redis.exists() {
+            atomic_write(&redis,b"# Redis settings: maxmemory, maxmemory-policy, appendonly, save, databases\nappendonly yes\nsave 60 1\n")?;
+        }
+        let apache = self.layout.path("config/overrides/apache.conf")?;
+        if !apache.exists() {
+            atomic_write(&apache,b"# Apache settings: Timeout, KeepAlive, MaxKeepAliveRequests, KeepAliveTimeout\nTimeout 60\nKeepAlive On\n")?;
+        }
+        Ok(())
+    }
+    pub fn override_path(&self, id: &str) -> Result<PathBuf> {
+        if id == "apache" {
+            return self.layout.path("config/overrides/apache.conf");
+        }
+        if id == "redis" {
+            return self.layout.path("config/overrides/redis.conf");
+        }
+        if let Some(p) = id.strip_prefix("php:") {
+            return self.layout.php_ini(p);
+        }
+        if let Some(p) = id.strip_prefix("mysql:") {
+            valid_id(p)?;
+            return self.layout.path(format!("config/overrides/mysql/{p}.ini"));
+        }
+        bail!("未知服务")
+    }
+    pub fn save_override(&mut self, id: &str, text: &str) -> Result<()> {
+        self.read_service_config(id)?;
+        let full = service_config::replace_user(&self.layout, id, text)?;
+        self.save_service_config(id, &full)
+    }
+    fn service_kind(&self, id: &str) -> Result<Kind> {
+        ensure!(
+            self.service_ids().iter().any(|service| service == id),
+            "服务不存在"
+        );
+        Ok(if id == "apache" {
+            Kind::Apache
+        } else if id == "redis" {
+            Kind::Redis
+        } else if id.starts_with("php:") {
+            Kind::Php
+        } else {
+            Kind::Mysql
+        })
+    }
+    fn service_candidate(&self, id: &str) -> Result<PathBuf> {
+        match self.service_kind(id)? {
+            Kind::Apache => self.apache_config(),
+            Kind::Redis => self.redis_config(),
+            Kind::Php => self.php_config(
+                self.config
+                    .php
+                    .iter()
+                    .find(|s| id == format!("php:{}", s.package))
+                    .context("PHP 不存在")?,
+            ),
+            Kind::Mysql => self.mysql_config(
+                self.config
+                    .mysql
+                    .iter()
+                    .find(|s| id == format!("mysql:{}", s.id))
+                    .context("MySQL 不存在")?,
+            ),
+        }
+    }
+    pub fn read_service_config(&self, id: &str) -> Result<String> {
+        self.service_kind(id)?;
+        if service_config::needs_template(&self.layout, id)? {
+            let candidate = self.service_candidate(id)?;
+            service_config::commit(&self.layout, id, &candidate)?;
+        }
+        service_config::read(&self.layout, id)
+    }
+    pub fn save_service_config(&mut self, id: &str, text: &str) -> Result<()> {
+        service_config::validate_edit(&self.layout, id, self.service_kind(id)?, text)?;
+        let file = service_config::path(&self.layout, id)?;
+        let before = fs::read(&file)?;
+        atomic_write(
+            &self.layout.path(file.with_extension("before-edit"))?,
+            &before,
+        )?;
+        atomic_write(&file, text.as_bytes())?;
+        let candidate = self.config.clone();
+        if let Err(e) = self.apply(candidate) {
+            return match atomic_write(&file, &before) {
+                Ok(()) => Err(e.context("配置应用失败；编辑前文件已恢复")),
+                Err(restore) => Err(e.context(format!("配置应用失败；文件恢复失败：{restore:#}"))),
+            };
+        }
+        Ok(())
+    }
+    fn configuration_files(&self) -> Result<BTreeMap<PathBuf, Vec<u8>>> {
+        let mut result = BTreeMap::new();
+        for id in self.service_ids() {
+            result.extend(service_config::snapshot(&self.layout, &id)?);
+        }
+        Ok(result)
+    }
+    pub fn snapshot(&self) -> Snapshot {
+        let mut rows = vec![];
+        for id in self.service_ids() {
+            let (title, ports) = if id == "apache" {
+                (
+                    format!(
+                        "Apache · {}",
+                        self.config.apache.as_deref().unwrap_or("未选择")
+                    ),
+                    self.config
+                        .http_ports()
+                        .iter()
+                        .map(u16::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                )
+            } else if id == "redis" {
+                (
+                    "Redis · 单实例".into(),
+                    self.config
+                        .redis
+                        .as_ref()
+                        .map(|r| r.port.to_string())
+                        .unwrap_or_default(),
+                )
+            } else if let Some(package) = id.strip_prefix("php:") {
+                let p = self.config.php.iter().find(|p| p.package == package);
+                (
+                    format!("PHP · {package}"),
+                    p.map(|p| format!("{}–{}", p.port, p.port + p.workers - 1))
+                        .unwrap_or_default(),
+                )
+            } else {
+                let spec = self
+                    .config
+                    .mysql
+                    .iter()
+                    .find(|m| format!("mysql:{}", m.id) == id);
+                (
+                    spec.map(|m| format!("MySQL · {} · {}", m.id, m.package))
+                        .unwrap_or_default(),
+                    spec.map(|m| m.port.to_string()).unwrap_or_default(),
+                )
+            };
+            let entries = self.running.get(&id);
+            let alive = entries
+                .map(|v| v.iter().filter(|p| p.process.running()).count())
+                .unwrap_or(0);
+            let expected = if let Some(p) = id.strip_prefix("php:") {
+                self.config
+                    .php
+                    .iter()
+                    .find(|s| s.package == p)
+                    .map(|s| s.workers as usize)
+                    .unwrap_or(1)
+            } else {
+                1
+            };
+            let listeners_ready = entries.is_some_and(|v| {
+                v.iter().all(|p| {
+                    !p.record.ports.is_empty()
+                        && p.record
+                            .ports
+                            .iter()
+                            .all(|port| p.process.owns_port(*port).unwrap_or(false))
+                })
+            });
+            let initializing = entries.is_some_and(|v| {
+                v.iter()
+                    .any(|p| p.process.running() && p.record.ports.is_empty())
+            });
+            let state = if self.errors.contains_key(&id) {
+                "异常"
+            } else if initializing {
+                "初始化中"
+            } else if alive == expected && listeners_ready {
+                "运行中"
+            } else if alive == expected {
+                "未就绪"
+            } else if alive > 0 {
+                "部分运行"
+            } else if entries.is_some() {
+                "已退出"
+            } else {
+                "已停止"
+            };
+            let detail = self.errors.get(&id).cloned().unwrap_or_else(|| {
+                entries
+                    .map(|v| {
+                        v.iter()
+                            .map(|p| p.record.identity.pid.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default()
+            });
+            rows.push(Row {
+                id,
+                title,
+                state: state.into(),
+                ports,
+                detail,
+                running: alive > 0,
+            });
+        }
+        Snapshot {
+            addresses: self.addresses.clone(),
+            config: self.config.clone(),
+            packages: self.packages.clone(),
+            rows,
+            applied_revision: self.applied.as_ref().map(|c| c.revision),
+            message: self.message.clone(),
+        }
+    }
+    pub fn service_ids(&self) -> Vec<String> {
+        self.service_ids_for(&self.config)
+    }
+    pub fn has_running(&self) -> bool {
+        self.running.values().flatten().any(|p| p.process.running())
+    }
+    pub fn start_all(&mut self) -> Result<()> {
+        self.start_selected(false)
+    }
+    pub fn start_common(&mut self) -> Result<()> {
+        self.start_selected(true)
+    }
+    fn start_selected(&mut self, common_only: bool) -> Result<()> {
+        let selected = self.config.startup_ids(common_only)?;
+        let before = self.running.keys().cloned().collect::<BTreeSet<_>>();
+        let result: Result<()> = (|| {
+            for id in selected {
+                self.start(&id)?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = result {
+            let mut rollback = vec![];
+            let ids = self
+                .running
+                .keys()
+                .filter(|id| !before.contains(*id))
+                .cloned()
+                .collect::<Vec<_>>();
+            for id in ids {
+                if let Err(err) = self.stop_internal(&id) {
+                    rollback.push(err.to_string());
+                }
+            }
+            bail!(
+                "启动失败：{e}；清理结果：{}",
+                if rollback.is_empty() {
+                    "新启动实例已停止".into()
+                } else {
+                    rollback.join("；")
+                }
+            );
+        }
+        self.applied = Some(self.config.clone());
+        self.applied_files = self.configuration_files()?;
+        self.message = "所需服务已启动并验证".into();
+        self.persist()?;
+        Ok(())
+    }
+    pub fn start(&mut self, id: &str) -> Result<()> {
+        ensure!(
+            self.config.service_usage(id)? != ServiceUsage::Disabled,
+            "服务已停用，请先在环境设置中调整使用方式"
+        );
+        if id == "apache" {
+            self.config.apache_dependencies()?;
+        }
+        let expected = id
+            .strip_prefix("php:")
+            .and_then(|p| self.config.php.iter().find(|s| s.package == p))
+            .map(|s| s.workers as usize)
+            .unwrap_or(1);
+        if let Some(entries) = self.running.get(id) {
+            ensure!(
+                !entries
+                    .iter()
+                    .any(|p| p.process.running() && p.record.ports.is_empty()),
+                "{id} 正在初始化，请等待完成并检查日志"
+            );
+            if entries.len() == expected
+                && entries.iter().all(|p| {
+                    p.process.running()
+                        && p.record
+                            .ports
+                            .iter()
+                            .all(|port| p.process.owns_port(*port).unwrap_or(false))
+                })
+            {
+                return Ok(());
+            }
+        }
+        if self
+            .running
+            .get(id)
+            .is_some_and(|v| v.iter().any(|p| p.process.running()))
+        {
+            self.stop_internal(id)?;
+        }
+        self.running.remove(id);
+        self.errors.remove(id);
+        let result = if id == "apache" {
+            self.start_apache()
+        } else if id == "redis" {
+            self.start_redis()
+        } else if let Some(p) = id.strip_prefix("php:") {
+            self.start_php(p)
+        } else if let Some(m) = id.strip_prefix("mysql:") {
+            self.start_mysql(m)
+        } else {
+            Err(crate::anyhow!("服务不存在"))
+        };
+        if let Err(ref e) = result {
+            self.errors.insert(id.into(), e.to_string());
+            self.message = e.to_string();
+        } else {
+            self.message = format!("{id} 已运行");
+            self.applied_files = self.configuration_files()?;
+        }
+        self.persist()?;
+        result
+    }
+    #[allow(clippy::too_many_arguments)] // All launch inputs are explicit to preserve process isolation.
+    fn launch(
+        &mut self,
+        id: &str,
+        kind: Kind,
+        exe: &Path,
+        cwd: &Path,
+        args: Vec<String>,
+        ports: Vec<u16>,
+        config: PathBuf,
+    ) -> Result<()> {
+        let listeners = if kind == Kind::Apache {
+            self.config.http_listeners()?
+        } else {
+            ports.iter().map(|p| (Ipv4Addr::LOCALHOST, *p)).collect()
+        };
+        for (address, port) in listeners {
+            let listener = TcpListener::bind((address, port))
+                .with_context(|| format!("监听 {address}:{port} 不可用，未访问占用服务"))?;
+            drop(listener);
+        }
+        let mut cmd = platform::command(
+            &self.layout.path(exe)?,
+            &self.layout.root,
+            &self.layout.path(cwd)?,
+        );
+        cmd.args(args);
+        if kind == Kind::Php {
+            cmd.env("PHP_INI_SCAN_DIR", self.layout.path("runtime/empty-ini")?)
+                .env("PHP_FCGI_MAX_REQUESTS", "0");
+        }
+        let log = self
+            .layout
+            .path(format!("logs/{}.log", id.replace(':', "-")))?;
+        let process = Process::from_child(platform::spawn_logged(&mut cmd, &log)?)?;
+        let record = Record {
+            id: id.into(),
+            kind,
+            identity: process.identity.clone(),
+            ports,
+            config,
+        };
+        self.running
+            .entry(id.into())
+            .or_default()
+            .push(Running { record, process });
+        self.persist()?;
+        let started = Instant::now();
+        loop {
+            let p = self
+                .running
+                .get(id)
+                .and_then(|v| v.last())
+                .context("进程记录丢失")?;
+            ensure!(p.process.running(), "{id} 已退出，查看 {}", log.display());
+            if p.record
+                .ports
+                .iter()
+                .all(|port| p.process.owns_port(*port).unwrap_or(false))
+            {
+                return Ok(());
+            }
+            ensure!(
+                started.elapsed() < Duration::from_secs(40),
+                "{id} 启动超时，进程保留以便正常关闭；查看日志"
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+    pub fn stop(&mut self, id: &str) -> Result<()> {
+        if id.starts_with("php:") {
+            ensure!(
+                !self
+                    .running
+                    .get("apache")
+                    .is_some_and(|v| v.iter().any(|p| p.process.running()))
+                    || !self
+                        .config
+                        .apache_dependencies()?
+                        .iter()
+                        .any(|dependency| dependency == id),
+                "该 PHP 被运行中的 Apache 站点使用，请先停止 Apache 或全部停止"
+            );
+        }
+        let result = self.stop_internal(id);
+        if let Err(ref e) = result {
+            self.errors.insert(id.into(), e.to_string());
+        }
+        result
+    }
+    fn stop_internal(&mut self, id: &str) -> Result<()> {
+        if let Some(entries) = self.running.get(id) {
+            for p in entries.iter().filter(|p| p.process.running()) {
+                match p.record.kind {
+                    Kind::Php => p.process.terminate_php()?,
+                    Kind::Mysql => {
+                        platform::mysql_shutdown(p.record.identity.pid).or_else(|error| {
+                            if let Some(port) = p.record.ports.first() {
+                                let server = p.process.listener_process(*port)?;
+                                platform::mysql_shutdown(server.identity.pid)
+                            } else {
+                                Err(error)
+                            }
+                        })?;
+                        p.process.wait(Duration::from_secs(45))?;
+                    }
+                    Kind::Redis => {
+                        ensure!(
+                            p.process.owns_port(p.record.ports[0])?,
+                            "Redis 端口不属于本实例，拒绝关闭"
+                        );
+                        let response = protocol::redis(p.record.ports[0], &["SHUTDOWN"]);
+                        if let Err(e) = response
+                            && p.process.running()
+                        {
+                            return Err(e);
+                        }
+                        p.process.wait(Duration::from_secs(20))?;
+                    }
+                    Kind::Apache => {
+                        platform::apache_shutdown(p.record.identity.pid)?;
+                        p.process.wait(Duration::from_secs(20))?;
+                    }
+                }
+            }
+        }
+        self.running.remove(id);
+        self.errors.remove(id);
+        self.persist()?;
+        self.message = format!("{id} 已停止");
+        Ok(())
+    }
+    pub fn stop_all(&mut self) -> Result<()> {
+        let mut errors = vec![];
+        if let Err(e) = self.stop_internal("apache") {
+            errors.push(e.to_string());
+        }
+        if self
+            .running
+            .get("apache")
+            .is_some_and(|v| v.iter().any(|p| p.process.running()))
+        {
+            bail!("Apache 未能停止，保留依赖服务：{}", errors.join("；"));
+        }
+        let ids = self.running.keys().cloned().collect::<Vec<_>>();
+        for id in ids {
+            if let Err(e) = self.stop_internal(&id) {
+                errors.push(format!("{id}: {e}"));
+            }
+        }
+        ensure!(errors.is_empty(), "{}", errors.join("；"));
+        self.applied = None;
+        self.persist()?;
+        self.message = "所有受管理服务已正常停止".into();
+        Ok(())
+    }
+    pub fn restart(&mut self, id: &str) -> Result<()> {
+        if id.starts_with("php:") && self.running.contains_key("apache") {
+            return self.apply(self.config.clone());
+        }
+        self.stop(id)?;
+        self.start(id)
+    }
+    pub fn reload(&mut self, id: &str) -> Result<()> {
+        ensure!(id == "apache", "该服务不支持完整配置重加载，请使用重启");
+        let parent = self
+            .running
+            .get(id)
+            .and_then(|v| v.first())
+            .context("Apache 未运行")?;
+        ensure!(
+            parent.process.owns_port(self.config.http_port)?,
+            "Apache 未就绪或端口归属不符"
+        );
+        ensure!(
+            self.applied
+                .as_ref()
+                .is_some_and(|c| c.revision == self.config.revision),
+            "存在未应用设置，请先应用设置"
+        );
+        let active = parent.record.config.clone();
+        let override_path = service_config::path(&self.layout, "apache")?;
+        ensure!(
+            active == override_path,
+            "当前进程使用旧配置路径，请先重启 Apache"
+        );
+        let previous = self
+            .applied_files
+            .get(&active)
+            .cloned()
+            .context("缺少已应用配置快照，请先重启 Apache")?;
+        let previous_override = Some(previous.clone());
+        let candidate = match self.apache_config_named("httpd-reload-candidate.conf") {
+            Ok(path) => path,
+            Err(error) => {
+                atomic_write(&active, &previous)?;
+                return Err(error.context("新配置检查未通过；文件已恢复，运行服务保持不变"));
+            }
+        };
+        let bytes = fs::read(candidate)?;
+        atomic_write(&active.with_extension("backup.conf"), &previous)?;
+        if let Err(error) = self.reload_apache_bytes(&active, &bytes) {
+            let recovery = self.reload_apache_bytes(&active, &previous);
+            if let Err(ref restore) = recovery {
+                self.applied = None;
+                self.errors.insert(
+                    id.into(),
+                    format!("重加载失败：{error:#}；恢复失败：{restore:#}"),
+                );
+            } else if let Some(bytes) = previous_override {
+                atomic_write(&override_path, &bytes)?;
+                self.errors.remove(id);
+            }
+            self.persist()?;
+            bail!(
+                "重加载失败：{error:#}；{}",
+                recovery
+                    .err()
+                    .map(|e| format!("恢复失败：{e:#}"))
+                    .unwrap_or_else(|| "上一配置已恢复并验证".into())
+            );
+        }
+        self.applied_files
+            .insert(override_path.clone(), fs::read(override_path)?);
+        self.errors.remove(id);
+        self.message = "Apache 已重加载并验证；主进程、PHP 和数据库保持运行".into();
+        self.persist()?;
+        Ok(())
+    }
+    fn reload_apache_bytes(&self, active: &Path, bytes: &[u8]) -> Result<()> {
+        let marker = platform::random_token()?;
+        let directory = self.generated()?;
+        let marker_path = directory.join(format!("reload-{marker}.txt"));
+        atomic_write(&marker_path, marker.as_bytes())?;
+        let mut candidate_bytes = bytes.to_vec();
+        candidate_bytes.extend_from_slice(format!("\nAlias /_flaragon_reload_{marker} \"{}\"\n<Directory \"{}\">\nRequire local\n</Directory>\n", apache_path(&marker_path)?, apache_path(&directory)?).as_bytes());
+        let candidate = directory.join("httpd-reload-check.conf");
+        atomic_write(&candidate, &candidate_bytes)?;
+        let package = self.package(
+            self.config.apache.as_deref().context("未选择 Apache")?,
+            Kind::Apache,
+        )?;
+        let mut cmd = platform::command(&package.executable, &self.layout.root, &package.directory);
+        cmd.arg("-f").arg(&candidate).arg("-t");
+        platform::capture(&mut cmd, Duration::from_secs(10))
+            .context("Apache 重加载配置校验失败")?;
+        let parent = self
+            .running
+            .get("apache")
+            .and_then(|v| v.first())
+            .context("Apache 未运行")?;
+        ensure!(
+            parent.process.owns_port(self.config.http_port)?,
+            "Apache 端口归属不符"
+        );
+        atomic_write(active, &candidate_bytes)?;
+        platform::apache_reload(&parent.process)?;
+        let start = Instant::now();
+        let host = "localhost";
+        loop {
+            ensure!(parent.process.running(), "Apache 重加载期间主进程退出");
+            if parent.process.owns_port(self.config.http_port)?
+                && protocol::http(
+                    self.config.http_port,
+                    host,
+                    &format!("/_flaragon_reload_{marker}"),
+                )
+                .is_ok_and(|(status, body)| status == 200 && body == marker)
+                && self.verify_sites().is_ok()
+            {
+                atomic_write(active, bytes)?;
+                return Ok(());
+            }
+            ensure!(
+                start.elapsed() < Duration::from_secs(20),
+                "Apache 重加载验证超时"
+            );
+            thread::sleep(Duration::from_millis(150));
+        }
+    }
+    fn persist(&self) -> Result<()> {
+        let records = self
+            .running
+            .values()
+            .flatten()
+            .filter(|p| p.process.running())
+            .map(|p| {
+                let mut record = p.record.clone();
+                record.identity.executable = self.layout.relative(&record.identity.executable)?;
+                record.config = self.layout.relative(&record.config)?;
+                Ok(record)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let applied_files = self
+            .applied_files
+            .iter()
+            .map(|(path, bytes)| Ok((self.layout.relative(path)?, bytes.clone())))
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let applied = self
+            .applied
+            .clone()
+            .map(|mut config| -> Result<Config> {
+                config.relativize_paths(&self.layout)?;
+                Ok(config)
+            })
+            .transpose()?;
+        atomic_write(
+            &self.layout.path("runtime/state/processes.json")?,
+            &serde_json::to_vec_pretty(&RuntimeState {
+                records,
+                token: self.token.clone(),
+                applied,
+                applied_files,
+            })?,
+        )
+    }
+    fn recover(&mut self) -> Result<()> {
+        let path = self.layout.path("runtime/state/processes.json")?;
+        if !path.exists() {
+            return Ok(());
+        }
+        let state: RuntimeState = serde_json::from_slice(&fs::read(path)?)
+            .context("运行记录损坏；为避免重复启动，请先检查 runtime/state")?;
+        ensure!(
+            state.token.len() == 32 && state.token.bytes().all(|c| c.is_ascii_hexdigit()),
+            "运行配置标识无效"
+        );
+        self.token = state.token;
+        self.applied = state.applied;
+        for (path, bytes) in state.applied_files {
+            let checked = self.layout.path(&path)?;
+            ensure!(
+                checked.starts_with(self.layout.path("config/overrides")?)
+                    || checked.starts_with(self.layout.path("config/services")?),
+                "运行配置快照路径无效"
+            );
+            self.applied_files.insert(checked, bytes);
+        }
+        for mut record in state.records {
+            record.identity.executable = self.layout.path(&record.identity.executable)?;
+            record.config = self.layout.path(&record.config)?;
+            if let Ok(process) = Process::recover(&record.identity) {
+                self.running
+                    .entry(record.id.clone())
+                    .or_default()
+                    .push(Running { record, process });
+            }
+        }
+        if self.has_running() {
+            self.message = "已恢复管理本环境正在运行的服务".into();
+        }
+        Ok(())
+    }
+    fn generated(&self) -> Result<PathBuf> {
+        let path = self.layout.path(format!(
+            "runtime/generated/{}-{}",
+            self.config.revision, self.token
+        ))?;
+        fs::create_dir_all(&path)?;
+        Ok(path)
+    }
+    fn php_config(&self, spec: &PhpSpec) -> Result<PathBuf> {
+        let package = self.package(&spec.package, Kind::Php)?;
+        let out = self.generated()?.join(format!("php-{}.ini", spec.package));
+        let session = self
+            .layout
+            .path(format!("runtime/temp/session-{}", spec.package))?;
+        fs::create_dir_all(&session)?;
+        let text = format!(
+            "[PHP]\nextension_dir=\"{}\"\nsys_temp_dir=\"{}\"\nupload_tmp_dir=\"{}\"\nsession.save_path=\"{}\"\nerror_log=\"{}\"\ncgi.fix_pathinfo=1\ncgi.force_redirect=0\n",
+            apache_path(&package.directory.join("ext"))?,
+            apache_path(&self.layout.path("runtime/temp")?)?,
+            apache_path(&self.layout.path("runtime/temp")?)?,
+            apache_path(&session)?,
+            apache_path(
+                &self
+                    .layout
+                    .path(format!("logs/php-{}-error.log", spec.package))?
+            )?
+        );
+        let overrides = fs::read_to_string(self.layout.php_ini(&spec.package)?)?;
+        service_config::prepare(
+            &self.layout,
+            &format!("php:{}", spec.package),
+            Kind::Php,
+            &text,
+            "",
+            &format!("log_errors=On\n{overrides}"),
+            &out,
+            Some(&crate::config_template::load(
+                &self.layout,
+                &package.directory,
+                Kind::Php,
+                &text,
+            )?),
+        )?;
+        let mut cmd = platform::command(&package.executable, &self.layout.root, &package.directory);
+        cmd.env("PHP_INI_SCAN_DIR", self.layout.path("runtime/empty-ini")?)
+            .arg("-c")
+            .arg(&out)
+            .args(["-r", "echo 'FLARAGON_OK';"]);
+        let result = platform::capture(&mut cmd, Duration::from_secs(8))?;
+        ensure!(
+            result.trim() == "FLARAGON_OK",
+            "PHP 配置无效：{}",
+            result.trim()
+        );
+        Ok(out)
+    }
+    fn start_php(&mut self, id: &str) -> Result<()> {
+        let spec = self
+            .config
+            .php
+            .iter()
+            .find(|p| p.package == id)
+            .context("PHP 实例不存在")?
+            .clone();
+        let package = self.package(id, Kind::Php)?.clone();
+        let candidate = self.php_config(&spec)?;
+        let ini = service_config::commit(&self.layout, &format!("php:{id}"), &candidate)?;
+        fs::create_dir_all(self.layout.path("runtime/empty-ini")?)?;
+        for offset in 0..spec.workers {
+            let port = spec.port + offset;
+            self.launch(
+                &format!("php:{id}"),
+                Kind::Php,
+                &package.directory.join("php-cgi.exe"),
+                &package.directory,
+                vec![
+                    "-c".into(),
+                    ini.to_string_lossy().into_owned(),
+                    "-b".into(),
+                    format!("127.0.0.1:{port}"),
+                ],
+                vec![port],
+                ini.clone(),
+            )?;
+        }
+        Ok(())
+    }
+    fn mysql_config(&self, spec: &MysqlSpec) -> Result<PathBuf> {
+        let p = self.package(&spec.package, Kind::Mysql)?;
+        let dir = spec.data_path(&self.layout)?;
+        ensure!(
+            mysql_series(&p.version)? == spec.series,
+            "MySQL 数据目录版本与组件不匹配"
+        );
+        let out = self.generated()?.join(format!("mysql-{}.ini", spec.id));
+        let extra = fs::read_to_string(
+            self.layout
+                .path(format!("config/overrides/mysql/{}.ini", spec.id))?,
+        )?;
+        let mut text = format!(
+            "[mysqld]\nbasedir=\"{}\"\ndatadir=\"{}\"\nport={}\nbind-address=127.0.0.1\nlog-error=\"{}\"\npid-file=\"{}\"\ntmpdir=\"{}\"\nsecure-file-priv=NULL\nlocal-infile=0\n",
+            apache_path(&p.directory)?,
+            apache_path(&dir)?,
+            spec.port,
+            apache_path(&self.layout.path(format!("logs/{}-error.log", spec.id))?)?,
+            apache_path(&self.layout.path(format!("runtime/state/{}.pid", spec.id))?)?,
+            apache_path(&self.layout.path("runtime/temp")?)?
+        );
+        if p.version.starts_with("8.") {
+            text.push_str("mysqlx=0\n");
+        }
+        if p.version.starts_with("5.7.") {
+            text.push_str("log_syslog=0\n");
+        }
+        service_config::prepare(
+            &self.layout,
+            &format!("mysql:{}", spec.id),
+            Kind::Mysql,
+            &text,
+            "",
+            &format!("character-set-server=utf8mb4\n{extra}"),
+            &out,
+            Some(&crate::config_template::load(
+                &self.layout,
+                &p.directory,
+                Kind::Mysql,
+                &text,
+            )?),
+        )?;
+        let mut cmd = platform::command(&p.executable, &self.layout.root, &p.directory);
+        cmd.arg(format!("--defaults-file={}", out.display()))
+            .args(["--verbose", "--help"]);
+        if let Err(error) = platform::capture(&mut cmd, Duration::from_secs(10)) {
+            let message = format!("{error:#}");
+            let diagnostics = message
+                .lines()
+                .filter(|line| {
+                    line.contains("[ERROR]")
+                        || line.contains("unknown variable")
+                        || line.contains("unknown option")
+                })
+                .take(8)
+                .collect::<Vec<_>>()
+                .join("\n");
+            bail!(
+                "MySQL 配置校验失败：{}",
+                if diagnostics.is_empty() {
+                    message.chars().take(1000).collect::<String>()
+                } else {
+                    diagnostics
+                }
+            );
+        }
+        Ok(out)
+    }
+    fn start_mysql(&mut self, id: &str) -> Result<()> {
+        let spec = self
+            .config
+            .mysql
+            .iter()
+            .find(|m| m.id == id)
+            .context("MySQL 实例不存在")?
+            .clone();
+        let p = self.package(&spec.package, Kind::Mysql)?.clone();
+        let candidate = self.mysql_config(&spec)?;
+        let conf = service_config::commit(&self.layout, &format!("mysql:{id}"), &candidate)?;
+        let dir = spec.data_path(&self.layout)?;
+        let marker = spec.binding_path(&self.layout)?;
+        self.inspect_mysql(&spec)?;
+        if marker.exists() {
+            let binding: String = serde_json::from_slice(&fs::read(&marker)?)?;
+            ensure!(
+                binding == format!("{}:{}", spec.package, p.version),
+                "数据目录绑定其他 MySQL 构建，拒绝自动升级或降级"
+            );
+            ensure!(dir.join("mysql").is_dir(), "数据目录不完整，拒绝重新初始化");
+        } else {
+            ensure!(
+                !dir.exists() || fs::read_dir(&dir)?.next().is_none(),
+                "已有非空数据目录没有绑定信息，拒绝初始化"
+            );
+            fs::create_dir_all(&dir)?;
+            let mut cmd = platform::command(&p.executable, &self.layout.root, &p.directory);
+            cmd.arg(format!("--defaults-file={}", conf.display()))
+                .arg("--initialize-insecure");
+            let log = self.layout.path(format!("logs/{id}-initialize.log"))?;
+            let mut child = platform::spawn_logged(&mut cmd, &log)?;
+            let process = Process::open(child.id())?;
+            let instance = format!("mysql:{id}");
+            self.running
+                .entry(instance.clone())
+                .or_default()
+                .push(Running {
+                    record: Record {
+                        id: instance.clone(),
+                        kind: Kind::Mysql,
+                        identity: process.identity.clone(),
+                        ports: vec![],
+                        config: conf.clone(),
+                    },
+                    process,
+                });
+            self.persist()?;
+            let started = Instant::now();
+            let status = loop {
+                if let Some(status) = child.try_wait()? {
+                    break status;
+                }
+                ensure!(
+                    started.elapsed() < Duration::from_secs(180),
+                    "MySQL 初始化仍在运行，已保留进程与数据；请查看初始化日志，不要重新初始化"
+                );
+                thread::sleep(Duration::from_millis(100));
+            };
+            self.running.remove(&instance);
+            self.persist()?;
+            ensure!(
+                status.success(),
+                "MySQL 初始化失败（{status}），保留数据目录；查看 {}",
+                log.display()
+            );
+            atomic_write(
+                &marker,
+                &serde_json::to_vec(&format!("{}:{}", spec.package, p.version))?,
+            )?;
+        }
+        self.launch(
+            &format!("mysql:{id}"),
+            Kind::Mysql,
+            &p.executable,
+            &p.directory,
+            vec![
+                format!("--defaults-file={}", conf.display()),
+                "--console".into(),
+            ],
+            vec![spec.port],
+            conf,
+        )?;
+        ensure!(
+            protocol::mysql_greeting(spec.port)?.starts_with(&p.version),
+            "MySQL 实际版本不符"
+        );
+        Ok(())
+    }
+    fn redis_config(&self) -> Result<PathBuf> {
+        let spec = self.config.redis.as_ref().context("未发现 Redis")?;
+        let package = self.package(&spec.package, Kind::Redis)?;
+        let out = self.generated()?.join("redis.conf");
+        let extra = fs::read_to_string(self.layout.path("config/overrides/redis.conf")?)?;
+        let text = format!(
+            "bind 127.0.0.1\nprotected-mode yes\nport {}\ndir \"{}\"\ndbfilename dump.rdb\nlogfile \"{}\"\n",
+            spec.port,
+            apache_path(&self.layout.path("data/redis")?)?,
+            apache_path(&self.layout.path("logs/redis-server.log")?)?
+        );
+        service_config::prepare(
+            &self.layout,
+            "redis",
+            Kind::Redis,
+            &text,
+            "",
+            &extra,
+            &out,
+            Some(&crate::config_template::load(
+                &self.layout,
+                &package.directory,
+                Kind::Redis,
+                &text,
+            )?),
+        )?;
+        Ok(out)
+    }
+    fn start_redis(&mut self) -> Result<()> {
+        let spec = self.config.redis.as_ref().context("未发现 Redis")?.clone();
+        let p = self.package(&spec.package, Kind::Redis)?.clone();
+        let candidate = self.redis_config()?;
+        let conf = service_config::commit(&self.layout, "redis", &candidate)?;
+        self.launch(
+            "redis",
+            Kind::Redis,
+            &p.executable,
+            &self.layout.root.clone(),
+            vec![apache_path(conf.strip_prefix(&self.layout.root)?)?],
+            vec![spec.port],
+            conf,
+        )?;
+        let started = Instant::now();
+        loop {
+            let process = self
+                .running
+                .get("redis")
+                .and_then(|v| v.first())
+                .context("Redis 进程记录丢失")?;
+            ensure!(
+                process.process.owns_port(spec.port)?,
+                "Redis 监听者已变化，停止健康探测"
+            );
+            match protocol::redis(spec.port, &["PING"]) {
+                Ok(response) if response.starts_with("+PONG") => break,
+                Err(error)
+                    if error.to_string().contains("LOADING")
+                        && started.elapsed() < Duration::from_secs(30) =>
+                {
+                    thread::sleep(Duration::from_millis(100))
+                }
+                Err(error) => return Err(error),
+                _ => bail!("Redis 未就绪"),
+            }
+        }
+        Ok(())
+    }
+    fn apache_config(&self) -> Result<PathBuf> {
+        self.apache_config_named("httpd.conf")
+    }
+    fn apache_config_named(&self, filename: &str) -> Result<PathBuf> {
+        let p = self.package(
+            self.config.apache.as_deref().context("未选择 Apache")?,
+            Kind::Apache,
+        )?;
+        let dir = self.generated()?;
+        let conf = dir.join(filename);
+        let health = dir.join("health.php");
+        atomic_write(&health,b"<?php header('Content-Type: application/json'); echo json_encode(['version'=>PHP_VERSION,'ini'=>php_ini_loaded_file(),'root'=>$_SERVER['DOCUMENT_ROOT']]);")?;
+        let mut text = format!(
+            "ServerRoot \"{}\"\nPidFile \"{}\"\nErrorLog \"{}\"\n",
+            apache_path(&p.directory)?,
+            apache_path(&self.layout.path("runtime/state/apache.pid")?)?,
+            apache_path(&self.layout.path("logs/apache-error.log")?)?
+        );
+        for (address, port) in self.config.http_listeners()? {
+            text.push_str(&format!("Listen {address}:{port}\n"));
+        }
+        text.push_str(&format!("DefaultRuntimeDir \"{}\"\n", apache_path(&dir)?));
+        for module in [
+            "authz_core",
+            "authz_host",
+            "authz_user",
+            "authn_core",
+            "access_compat",
+            "dir",
+            "mime",
+            "log_config",
+            "alias",
+            "rewrite",
+            "env",
+            "setenvif",
+            "proxy",
+            "proxy_fcgi",
+            "proxy_balancer",
+            "lbmethod_byrequests",
+            "slotmem_shm",
+        ] {
+            let path = self
+                .layout
+                .path(p.directory.join(format!("modules/mod_{module}.so")))?;
+            ensure!(path.is_file(), "Apache 缺少模块：{module}");
+            text.push_str(&format!(
+                "LoadModule {module}_module \"{}\"\n",
+                apache_path(&path)?
+            ));
+        }
+        text.push_str(&format!("TypesConfig \"{}\"\nProxyRequests Off\nProxyFCGIBackendType GENERIC\n<Directory />\nAllowOverride None\nRequire all denied\n</Directory>\n",apache_path(&p.directory.join("conf/mime.types"))?));
+        // Winnt proxy_fcgi prepends a slash to drive-qualified filenames; php-cgi requires the drive at the start.
+        text.push_str("ProxyFCGISetEnvIf \"reqenv('SCRIPT_FILENAME') =~ m|^/([A-Za-z]:/.*)$|\" SCRIPT_FILENAME \"$1\"\n");
+        let extra = fs::read_to_string(self.layout.path("config/overrides/apache.conf")?)?;
+        let head = text;
+        let text = crate::web::routes(&self.layout, &self.config, &dir, &self.token)?;
+        let conf = service_config::prepare(
+            &self.layout,
+            "apache",
+            Kind::Apache,
+            &head,
+            &text,
+            &format!(
+                "ServerName localhost\nLogLevel warn\nThreadsPerChild 32\nDirectoryIndex index.php index.html\n{extra}"
+            ),
+            &conf,
+            Some(&crate::config_template::load(
+                &self.layout,
+                &p.directory,
+                Kind::Apache,
+                &head,
+            )?),
+        )?;
+        let mut cmd = platform::command(&p.executable, &self.layout.root, &p.directory);
+        cmd.arg("-f").arg(&conf).arg("-t");
+        platform::capture(&mut cmd, Duration::from_secs(10)).context("Apache 配置校验失败")?;
+        Ok(conf)
+    }
+    fn start_apache(&mut self) -> Result<()> {
+        self.config.apache_dependencies()?;
+        let candidate = self.apache_config()?;
+        let conf = service_config::commit(&self.layout, "apache", &candidate)?;
+        for id in self.config.apache_dependencies()? {
+            self.start(&id)?;
+        }
+        let p = self
+            .package(
+                self.config.apache.as_deref().context("未选择 Apache")?,
+                Kind::Apache,
+            )?
+            .clone();
+        self.launch(
+            "apache",
+            Kind::Apache,
+            &p.executable,
+            &p.directory,
+            vec!["-f".into(), conf.to_string_lossy().into_owned()],
+            self.config.http_ports(),
+            conf,
+        )?;
+        self.verify_sites()?;
+        self.applied = Some(self.config.clone());
+        Ok(())
+    }
+    pub fn verify_sites(&self) -> Result<()> {
+        let proc = self
+            .running
+            .get("apache")
+            .and_then(|v| v.first())
+            .context("Apache 未运行")?;
+        ensure!(
+            proc.process.owns_port(self.config.http_port)?,
+            "Apache 端口归属不符"
+        );
+        for port in self.config.http_ports() {
+            ensure!(proc.process.owns_port(port)?, "Apache 端口归属不符：{port}");
+        }
+        let (status, _) = protocol::http(self.config.http_port, "localhost", "/")?;
+        ensure!(status == 200, "项目导航页检查失败 HTTP {status}");
+        for project in self.config.projects.iter().filter(|p| p.enabled) {
+            let root = self.layout.project_root(project)?;
+            let php = project
+                .php
+                .as_ref()
+                .or(self.config.default_php.as_ref())
+                .context("PHP 未选择")?;
+            self.verify_http(
+                self.config.http_port,
+                "localhost",
+                &format!("/_flaragon_{}_{}.php", self.token, project.id),
+                php,
+                &root,
+            )?;
+            if project.virtual_host {
+                self.verify_http(
+                    self.config.http_port,
+                    &project.domain,
+                    &format!("/_flaragon_{}.php", self.token),
+                    php,
+                    &root,
+                )?;
+            }
+        }
+        for php in self.config.php.iter().filter(|p| p.directory_entry.enabled) {
+            self.verify_http(
+                php.directory_entry.port,
+                "localhost",
+                &format!("/_flaragon_{}.php", self.token),
+                &php.package,
+                &self.layout.site_path(&php.directory_entry.directory)?,
+            )?;
+        }
+        Ok(())
+    }
+    fn verify_http(
+        &self,
+        port: u16,
+        host: &str,
+        route: &str,
+        php: &str,
+        root: &Path,
+    ) -> Result<()> {
+        let (status, body) = protocol::http(port, host, route)?;
+        ensure!(
+            status == 200,
+            "入口 {host}:{port}{route} 检查失败 HTTP {status}"
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).context("PHP 诊断响应无效")?;
+        let package = self.package(php, Kind::Php)?;
+        ensure!(
+            json["version"].as_str() == Some(&package.version),
+            "入口 PHP 版本不符：{host}:{port}"
+        );
+        let expected = apache_path(root)?;
+        ensure!(
+            json["root"].as_str().is_some_and(|v| v
+                .replace('\\', "/")
+                .trim_end_matches('/')
+                .eq_ignore_ascii_case(expected.trim_end_matches('/'))),
+            "入口根目录未生效：{host}:{port}"
+        );
+        let ini = apache_path(&service_config::path(&self.layout, &format!("php:{php}"))?)?;
+        ensure!(
+            json["ini"]
+                .as_str()
+                .is_some_and(|v| v.replace('\\', "/").eq_ignore_ascii_case(&ini)),
+            "入口 ini 未生效：{host}:{port}"
+        );
+        Ok(())
+    }
+    pub fn apply(&mut self, mut candidate: Config) -> Result<()> {
+        candidate.validate(&self.layout)?;
+        self.validate_settings(&candidate)?;
+        candidate.revision = self
+            .config
+            .revision
+            .checked_add(1)
+            .context("配置版本号超出范围")?;
+        let old = self.config.clone();
+        let old_token = self.token.clone();
+        let old_files = if self.has_running() {
+            self.applied_files.clone()
+        } else {
+            self.configuration_files()?
+        };
+        let old_applied = self.applied.clone();
+        let was_running = self.has_running();
+        let old_ids = self.running.keys().cloned().collect::<Vec<_>>();
+        let candidate_token = platform::random_token()?;
+        self.config = candidate;
+        self.token = candidate_token;
+        let preflight = (|| {
+            self.ensure_overrides()?;
+            let candidates = self
+                .service_ids()
+                .into_iter()
+                .map(|id| self.service_candidate(&id).map(|path| (id, path)))
+                .collect::<Result<Vec<_>>>()?;
+            atomic_write(
+                &self.layout.path("config/app.backup.json")?,
+                &serde_json::to_vec_pretty(&old)?,
+            )?;
+            Ok(candidates)
+        })();
+        let candidates = match preflight {
+            Ok(candidates) => candidates,
+            Err(e) => {
+                self.config = old;
+                self.token = old_token;
+                return Err(e);
+            }
+        };
+        if was_running && let Err(e) = self.stop_all() {
+            self.config = old;
+            self.token = old_token;
+            self.applied = None;
+            self.persist()?;
+            return Err(e.context("部分服务未能停止；配置未应用，请检查各实例状态"));
+        }
+        let commit_result = (|| {
+            for (id, path) in &candidates {
+                service_config::commit(&self.layout, id, path)?;
+            }
+            self.layout.save(&self.config)
+        })();
+        if let Err(error) = commit_result {
+            self.config = old;
+            self.token = old_token;
+            let mut restore_errors = vec![];
+            for (path, bytes) in &old_files {
+                if let Err(e) = atomic_write(path, bytes) {
+                    restore_errors.push(e.to_string());
+                }
+            }
+            if was_running {
+                for id in &old_ids {
+                    if let Err(e) = self.start(id) {
+                        restore_errors.push(e.to_string());
+                    }
+                }
+            }
+            self.applied = if restore_errors.is_empty() {
+                old_applied
+            } else {
+                None
+            };
+            self.applied_files = old_files;
+            self.persist()?;
+            bail!(
+                "保存配置失败：{error}；恢复结果：{}",
+                if restore_errors.is_empty() {
+                    "已恢复".into()
+                } else {
+                    restore_errors.join("；")
+                }
+            );
+        }
+        if was_running {
+            let result: Result<()> = (|| {
+                for id in old_ids
+                    .iter()
+                    .filter(|id| self.service_ids().contains(id))
+                    .cloned()
+                    .collect::<Vec<_>>()
+                {
+                    self.start(&id)?;
+                }
+                Ok(())
+            })();
+            if let Err(e) = result {
+                let stopped = self.stop_all();
+                self.config = old;
+                self.token = old_token;
+                self.applied = None;
+                let mut errors = vec![];
+                if let Err(error) = self.layout.save(&self.config) {
+                    errors.push(error.to_string());
+                }
+                for (path, bytes) in &old_files {
+                    if let Err(error) = atomic_write(path, bytes) {
+                        errors.push(error.to_string());
+                    }
+                }
+                let restored = if stopped.is_ok() && errors.is_empty() {
+                    for id in old_ids {
+                        if let Err(e) = self.start(&id) {
+                            errors.push(e.to_string());
+                        }
+                    }
+                    if errors.is_empty() {
+                        "已恢复".into()
+                    } else {
+                        errors.join("；")
+                    }
+                } else {
+                    format!(
+                        "恢复待处理：{}；{}",
+                        stopped.err().map(|e| e.to_string()).unwrap_or_default(),
+                        errors.join("；")
+                    )
+                };
+                self.applied = if restored == "已恢复" {
+                    old_applied
+                } else {
+                    None
+                };
+                self.applied_files = old_files;
+                self.persist()?;
+                bail!("应用失败：{e}；上一配置：{restored}");
+            }
+            self.applied = Some(self.config.clone());
+            self.applied_files = self.configuration_files()?;
+            self.message = "配置已应用，运行结果已验证".into();
+        } else {
+            self.message =
+                "完整配置已保存并完成预检查；启动后验证生效（Redis 语法由启动验证）".into();
+            self.applied = None;
+        }
+        self.persist()?;
+        Ok(())
+    }
+}
+
+fn next_port(config: &Config, start: u16, count: u16) -> Result<u16> {
+    let mut used: BTreeSet<_> = config.http_ports().into_iter().collect();
+    for p in &config.php {
+        for offset in 0..p.workers {
+            used.insert(p.port.saturating_add(offset));
+        }
+    }
+    used.extend(config.mysql.iter().map(|m| m.port));
+    if let Some(r) = &config.redis {
+        used.insert(r.port);
+    }
+    (start..=u16::MAX - count)
+        .find(|first| (0..count).all(|offset| !used.contains(&(first + offset))))
+        .context("没有可分配的配置端口")
+}

@@ -1,0 +1,517 @@
+import { CheckBox, LineEdit, ScrollView, AboutSlint } from "std-widgets.slint";
+
+export struct ServiceRow { id: string, name: string, subtitle: string, module: string, common: bool, state: string, ports: string, detail: string, running: bool, can-start: bool, can-stop: bool }
+export struct ProjectRow { name: string, domain: string, enabled: bool, shared: bool, visible: bool }
+export struct PhpSetting { name: string, id: string, port: string, workers: string, usage: int, locked: bool, directory-enabled: bool, directory-port: string, directory-root: string, directory-address: string }
+export struct MysqlSetting { id: string, name: string, package-index: int, port: string, usage: int, fresh: bool, locked: bool, hint: string, exists: bool, valid: bool, reuse-data: bool }
+
+global ServiceColumns {
+    out property <length> usage: 80px;
+    out property <length> ports: 104px;
+    out property <length> state: 88px;
+    out property <length> actions: 152px;
+    out property <length> gap: 12px;
+    out property <length> inset: 12px;
+    out property <length> trailing-inset: 26px;
+}
+
+component Action inherits Rectangle {
+    in property <string> text;
+    in property <bool> primary: false;
+    in property <bool> selected: false;
+    in property <bool> enabled: true;
+    in property <bool> danger: false;
+    in property <bool> wrap-text: false;
+    callback clicked;
+    min-width: 72px; height: 34px;
+    border-radius: 7px;
+    background: !enabled ? #f1f3f7 : primary ? (touch.has-hover ? #4338ca : #4f46e5) : selected ? #eef0ff : touch.has-hover ? #f6f7fc : #ffffff;
+    border-width: 1px; border-color: enabled && focus.has-focus ? #8178ee : primary ? #4f46e5 : selected ? #c9c5f8 : #e2e6ef;
+    accessible-role: button; accessible-label: text; accessible-enabled: enabled;
+    accessible-action-default => { if enabled { root.clicked(); } }
+    Text { text: root.text; x: root.wrap-text ? 12px : 0px; width: parent.width - (root.wrap-text ? 24px : 0px); height: parent.height; wrap: root.wrap-text ? word-wrap : no-wrap; color: !root.enabled ? #9ba3b5 : root.primary ? #ffffff : root.danger ? #c2414b : root.selected ? #5145c5 : #36415a; font-size: 12px; font-weight: root.selected ? 600 : 400; horizontal-alignment: root.wrap-text ? left : center; vertical-alignment: center; }
+    focus := FocusScope {
+        enabled: root.enabled;
+        key-pressed(event) => { if event.text == "\n" || event.text == " " { root.clicked(); return accept; } return reject; }
+        touch := TouchArea { enabled: root.enabled; clicked => { focus.focus(); root.clicked(); } }
+    }
+}
+
+component Nav inherits Rectangle {
+    in property <string> text;
+    in property <image> icon;
+    in property <bool> active;
+    callback clicked;
+    height: 44px; border-radius: 8px;
+    background: active ? #eef0ff : area.has-hover ? #f4f6fa : transparent;
+    HorizontalLayout { padding-left: 16px; padding-right: 12px; spacing: 12px;
+        Rectangle { width: 20px;
+            Image { source: root.icon; width: 20px; height: 20px; y: (parent.height - self.height) / 2; image-fit: contain; colorize: root.active ? #4f46e5 : #8b95aa; }
+        }
+        Text { text: root.text; color: root.active ? #4338ca : #64708a; font-weight: root.active ? 600 : 400; font-size: 14px; vertical-alignment: center; }
+    }
+    area := TouchArea { clicked => { root.clicked(); } }
+    accessible-role: button; accessible-label: text;
+    accessible-action-default => { root.clicked(); }
+}
+
+component UsageChoice inherits Rectangle {
+    in-out property <int> current-index: 1;
+    in property <bool> enabled: true;
+    width: 144px; height: 32px; border-radius: 6px; background: #e9edf5;
+    HorizontalLayout { padding: 2px; spacing: 2px;
+        for label[index] in ["常用", "普通", "停用"] : Rectangle {
+            border-radius: 4px; background: root.current-index == index ? (root.enabled ? #ffffff : #f5f6fa) : transparent;
+            accessible-role: button; accessible-label: label; accessible-enabled: root.enabled;
+            accessible-action-default => { if root.enabled { root.current-index = index; } }
+            Text { text: label; color: !root.enabled ? #9ba3b5 : root.current-index == index ? #4f46e5 : #64708a; font-size: 11px; font-weight: root.current-index == index ? 600 : 400; horizontal-alignment: center; vertical-alignment: center; }
+            focus := FocusScope { enabled: root.enabled;
+                key-pressed(event) => { if event.text == " " || event.text == "\n" { root.current-index = index; return accept; } return reject; }
+                TouchArea { enabled: root.enabled; clicked => { focus.focus(); root.current-index = index; } }
+            }
+        }
+    }
+}
+
+component VersionChoice inherits Rectangle {
+    in property <string> text;
+    in property <bool> enabled: true;
+    callback clicked;
+    height: 32px; min-width: 120px; border-radius: 5px;
+    background: enabled ? #ffffff : #f1f3f7; border-width: 1px; border-color: #dce2ed;
+    accessible-role: button; accessible-label: "选择版本：" + text; accessible-enabled: enabled;
+    accessible-action-default => { if enabled { root.clicked(); } }
+    HorizontalLayout { padding-left: 9px; padding-right: 9px; spacing: 6px;
+        Text { text: root.text == "" ? "请选择版本" : root.text; color: root.enabled ? #36415a : #9ba3b5; font-size: 12px; overflow: elide; vertical-alignment: center; horizontal-stretch: 1; }
+        Text { text: "选择"; width: 26px; color: root.enabled ? #4f46e5 : #9ba3b5; font-size: 11px; vertical-alignment: center; }
+    }
+    focus := FocusScope { enabled: root.enabled;
+        key-pressed(event) => { if event.text == " " || event.text == "\n" { root.clicked(); return accept; } return reject; }
+        TouchArea { enabled: root.enabled; clicked => { focus.focus(); root.clicked(); } }
+    }
+}
+
+component Label inherits Text { color: #63708b; font-size: 12px; vertical-alignment: center; }
+component Heading inherits Text { color: #1d2840; font-size: 18px; font-weight: 600; }
+component FormField inherits VerticalLayout {
+    in property <string> label;
+    in-out property <string> value;
+    in property <string> placeholder;
+    in property <bool> enabled: true;
+    spacing: 7px;
+    Label { text: root.label; }
+    LineEdit { enabled: root.enabled; text <=> root.value; placeholder-text: root.placeholder; }
+}
+
+export component AboutWindow inherits Window {
+    in property <string> app-version;
+    title: "关于 Flaragon"; width: 440px; height: 330px;
+    background: #ffffff; default-font-family: "Microsoft YaHei UI";
+    VerticalLayout { padding: 28px; spacing: 12px;
+        Image { source: @image-url("../assets/flaragon.svg"); width: 48px; height: 48px; }
+        Heading { text: "Flaragon"; font-size: 24px; }
+        Text { text: root.app-version + " · Windows x64\n个人 PHP 开发环境"; color: #68748b; }
+        Text { text: "编辑器：Scintilla 5.6.7\n第三方许可随程序保留于 licenses 目录。"; font-size: 12px; color: #68748b; }
+        AboutSlint { }
+    }
+}
+
+export component Tray inherits SystemTrayIcon {
+    icon: @image-url("../assets/flaragon.svg"); tooltip: "Flaragon · 本地开发环境";
+    callback action(string);
+    Menu {
+        MenuItem { title: "打开 Flaragon"; activated => { root.action("show"); } }
+        MenuItem { title: "启动常用"; activated => { root.action("start-common"); } }
+        MenuItem { title: "启动全部"; activated => { root.action("start-all"); } }
+        MenuItem { title: "全部停止"; activated => { root.action("stop-all"); } }
+        MenuSeparator { }
+        MenuItem { title: "停止并退出"; activated => { root.action("exit"); } }
+    }
+    clicked => { root.action("show"); }
+}
+
+export component MainWindow inherits Window {
+    in property <string> app-version;
+    title: "Flaragon · 本地开发环境"; preferred-width: 1120px; preferred-height: 760px; min-width: 980px; min-height: 650px;
+    background: #f6f8fc; default-font-family: "Microsoft YaHei UI"; default-font-size: 13px;
+    icon: @image-url("../assets/flaragon.svg");
+    in-out property <int> page: 0;
+    in-out property <int> filter: 0;
+    in-out property <bool> busy: true;
+    in property <string> status: "正在读取环境…";
+    in property <bool> failed: false;
+    in property <string> environment;
+    in property <string> summary;
+    in property <int> running-count;
+    in property <[int]> service-counts;
+    in property <[string]> picker-options;
+    in property <string> picker-title;
+    in-out property <int> picker-selected: 0;
+    in property <bool> apache-locked;
+    in property <bool> redis-locked;
+    in-out property <int> apache-usage: 1;
+    in property <int> project-count;
+    in property <int> package-count;
+    in property <[ServiceRow]> services;
+    in-out property <bool> launch-at-login;
+    in-out property <bool> start-common-services;
+    in property <bool> saved-launch-at-login;
+    in property <bool> saved-start-common-services;
+    private property <bool> startup-dirty: root.launch-at-login != root.saved-launch-at-login || root.start-common-services != root.saved-start-common-services;
+    in property <string> startup-status: "正在读取启动设置…";
+    in property <bool> startup-failed: false;
+    in property <[ProjectRow]> projects;
+    in-out property <int> project-index: -1;
+    in-out property <string> project-name;
+    in-out property <string> project-id;
+    in-out property <string> project-group;
+    in-out property <bool> project-virtual-host: false;
+    in-out property <bool> project-lan: false;
+    in-out property <bool> project-listed: true;
+    in-out property <string> project-search;
+    in-out property <int> project-filter: 0;
+    in-out property <string> project-domain;
+    in-out property <string> project-directory;
+    in-out property <string> project-docroot;
+    in-out property <int> project-php: 0;
+    in-out property <bool> project-enabled: true;
+    in property <[string]> php-options;
+    in property <[string]> default-php-options;
+    in property <[string]> apache-options;
+    in property <[string]> mysql-package-options;
+    in-out property <int> apache-index: 0;
+    in-out property <int> default-php-index: -1;
+    in-out property <string> http-port;
+    in-out property <string> http-address;
+    in property <[string]> address-options;
+    in-out property <[PhpSetting]> php-settings;
+    in-out property <[MysqlSetting]> mysql-settings;
+    in-out property <int> redis-usage: 1;
+    in-out property <string> redis-port;
+    in property <bool> has-redis;
+    callback action(string, string);
+    callback navigate(int);
+    callback select-project(int);
+    callback settings-row(string, int);
+    callback open-picker(string, int);
+    callback choose-directory(string, int);
+    callback pick-option(int);
+    callback show-picker;
+    show-picker => { picker.show(); }
+    picker := PopupWindow {
+        forward-focus: picker-focus;
+        width: min(620px, root.width - 48px); height: min(420px, root.height - 64px);
+        x: (root.width - self.width) / 2; y: (root.height - self.height) / 2;
+        Rectangle { background: #ffffff; border-radius: 10px; border-width: 1px; border-color: #dce2ed;
+            picker-focus := FocusScope {
+                key-pressed(event) => {
+                    if event.text == Key.Escape { picker.close(); return accept; }
+                    if event.text == Key.DownArrow { root.picker-selected = min(root.picker-options.length - 1, root.picker-selected + 1); return accept; }
+                    if event.text == Key.UpArrow { root.picker-selected = max(0, root.picker-selected - 1); return accept; }
+                    if event.text == "\n" { root.pick-option(root.picker-selected); picker.close(); return accept; }
+                    return reject;
+                }
+            VerticalLayout { padding: 20px; spacing: 14px;
+                Heading { text: root.picker-title; }
+                ScrollView { VerticalLayout { spacing: 6px;
+                    for option[index] in root.picker-options : Action { text: option; height: 52px; wrap-text: true; primary: root.picker-selected == index; clicked => { root.pick-option(index); picker.close(); } }
+                    Rectangle { vertical-stretch: 1; }
+                } }
+                HorizontalLayout { Rectangle {} Action { text: "取消"; clicked => { picker.close(); } } }
+            }
+            }
+        }
+    }
+    MenuBar {
+        Menu { title: "Flaragon";
+            MenuItem { title: "组件详情"; activated => { root.action("packages", ""); } }
+            MenuItem { title: "停止并退出"; activated => { root.action("exit", ""); } }
+        }
+        Menu { title: "帮助";
+            MenuItem { title: "关于 Flaragon"; activated => { root.action("about", ""); } }
+        }
+    }
+    HorizontalLayout { spacing: 0px;
+        Rectangle { width: 188px; background: #ffffff;
+            VerticalLayout { padding: 18px; spacing: 8px;
+                HorizontalLayout { height: 72px; spacing: 10px;
+                    Image { source: @image-url("../assets/flaragon.svg"); width: 34px; height: 34px; }
+                    VerticalLayout { spacing: 3px; Text { text: "Flaragon"; color: #202c46; font-size: 21px; font-weight: 700; } Text { text: "LOCAL DEVELOPMENT"; color: #98a1b4; font-size: 8px; } }
+                }
+                Label { text: "工作空间"; height: 28px; font-size: 10px; }
+                Nav { text: "服务管理"; icon: @image-url("../assets/nav-services.svg"); active: root.page == 0; clicked => { root.navigate(0); } }
+                Nav { text: "项目管理"; icon: @image-url("../assets/nav-projects.svg"); active: root.page == 1; clicked => { root.navigate(1); } }
+                Nav { text: "环境设置"; icon: @image-url("../assets/nav-settings.svg"); active: root.page == 2; clicked => { root.navigate(2); } }
+                Rectangle { vertical-stretch: 1; }
+                Rectangle { height: 1px; background: #edf0f6; }
+                Nav { text: "关于 Flaragon"; icon: @image-url("../assets/nav-about.svg"); clicked => { root.action("about", ""); } }
+                Action { text: "停止并退出"; enabled: !root.busy; clicked => { root.action("exit", ""); } }
+                Text { text: "WINDOWS x64   /   v" + root.app-version; color: #a3abbb; font-size: 9px; height: 26px; vertical-alignment: center; }
+            }
+        }
+        VerticalLayout { padding: 26px; spacing: 18px;
+            HorizontalLayout { height: 36px; spacing: 14px;
+                Heading { text: root.page == 0 ? "服务管理" : root.page == 1 ? "项目管理" : "环境设置"; font-size: 25px; horizontal-stretch: 1; vertical-alignment: center; }
+                if root.page == 0 : Action { width: 100px; text: "刷新组件"; enabled: !root.busy; clicked => { root.action("scan", ""); } }
+            }
+            if root.page == 0 : VerticalLayout { spacing: 16px;
+                HorizontalLayout { height: 80px; spacing: 12px;
+                    for item in [{ label: "运行中的服务", value: root.running-count }, { label: "本地项目", value: root.project-count }, { label: "已发现组件", value: root.package-count }] : Rectangle {
+                        background: #ffffff; border-radius: 10px; border-width: 1px; border-color: #e8ecf4;
+                        VerticalLayout { padding: 16px; spacing: 5px; Label { text: item.label; } Text { text: item.value; color: #293753; font-size: 24px; font-weight: 600; } }
+                    }
+                }
+                HorizontalLayout { height: 34px; spacing: 7px;
+                    for label[index] in ["全部", "Apache", "PHP", "MySQL", "Redis"] : Action { text: label + " " + root.service-counts[index]; width: 76px; selected: root.filter == index; clicked => { root.filter = index; } }
+                    Rectangle { horizontal-stretch: 1; }
+                    Action { text: "全部停止"; width: 88px; enabled: !root.busy; clicked => { root.action("stop-all", ""); } }
+                    HorizontalLayout { width: 136px; spacing: 4px;
+                        Action { text: "启动常用"; width: 100px; primary: true; enabled: !root.busy; clicked => { root.action("start-common", ""); } }
+                        Rectangle { width: 32px; height: 34px; border-radius: 7px; background: root.busy ? #f1f3f7 : #4f46e5;
+                            accessible-role: button; accessible-label: "更多启动选项"; accessible-enabled: !root.busy;
+                            accessible-action-default => { if !root.busy { start-menu.show(); } }
+                            Image { source: @image-url("../assets/chevron-down.svg"); width: 16px; height: 16px; x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; image-fit: contain; colorize: root.busy ? #9ba3b5 : #ffffff; }
+                            arrow-focus := FocusScope { enabled: !root.busy;
+                                key-pressed(event) => { if event.text == " " || event.text == "\n" { start-menu.show(); return accept; } return reject; }
+                                TouchArea { enabled: !root.busy; clicked => { arrow-focus.focus(); start-menu.show(); } }
+                            }
+                            start-menu := PopupWindow { width: 118px; height: 44px; y: 38px;
+                                Rectangle { background: #ffffff; border-radius: 7px; VerticalLayout { padding: 5px; Action { text: "启动全部"; clicked => { start-menu.close(); root.action("start-all", ""); } } } }
+                            }
+                        }
+                    }
+                }
+                Rectangle { background: #ffffff; border-radius: 10px; border-width: 1px; border-color: #e5eaf3;
+                    VerticalLayout { padding: 10px; spacing: 0px;
+                        Rectangle { height: 38px; background: #f6f8fc; border-radius: 6px;
+                            HorizontalLayout { width: service-list.visible-width; padding-left: ServiceColumns.inset; padding-right: ServiceColumns.trailing-inset; spacing: ServiceColumns.gap;
+                                Label { text: "组件 / 实例"; horizontal-stretch: 1; }
+                                Label { text: "使用方式"; width: ServiceColumns.usage; horizontal-alignment: center; }
+                                Label { text: "端口"; width: ServiceColumns.ports; horizontal-alignment: center; }
+                                Label { text: "状态"; width: ServiceColumns.state; horizontal-alignment: center; }
+                                Label { text: "操作"; width: ServiceColumns.actions; horizontal-alignment: center; }
+                            }
+                        }
+                        service-list := ScrollView { horizontal-scrollbar-policy: always-off; VerticalLayout { spacing: 0px;
+                            for service in root.services : Rectangle {
+                                visible: root.filter == 0 || (root.filter == 1 && service.module == "Apache") || (root.filter == 2 && service.module == "PHP") || (root.filter == 3 && service.module == "MySQL") || (root.filter == 4 && service.module == "Redis");
+                                height: self.visible ? 72px : 0px; background: row-touch.has-hover ? #f8f9fe : #ffffff; border-radius: 6px;
+                                row-touch := TouchArea { }
+                                HorizontalLayout { padding-left: ServiceColumns.inset; padding-right: ServiceColumns.trailing-inset; spacing: ServiceColumns.gap;
+                                    Rectangle { horizontal-stretch: 1; min-width: 120px;
+                                        Rectangle { width: 34px; height: 34px; x: 0px; y: (parent.height - self.height) / 2; border-radius: 8px; background: #f0f2ff;
+                                            Text { text: service.module == "PHP" ? "php" : service.module == "Apache" ? "A" : service.module == "MySQL" ? "M" : "R"; color: #665ed8; font-size: 13px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
+                                        }
+                                        VerticalLayout { x: 46px; width: parent.width - 46px; height: 40px; y: (parent.height - self.height) / 2; spacing: 4px;
+                                            Text { text: service.name; color: #293550; font-weight: 600; overflow: elide; vertical-alignment: center; }
+                                            Text { text: service.subtitle; color: #748199; font-size: 11px; overflow: elide; vertical-alignment: center; }
+                                        }
+                                    }
+                                    Rectangle { width: ServiceColumns.usage;
+                                        Rectangle { width: 56px; height: 26px; x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; border-radius: 6px; background: service.common ? #eef0ff : transparent;
+                                            Text { text: service.common ? "常用" : "普通"; color: service.common ? #5145c5 : #748199; font-size: 11px; font-weight: service.common ? 600 : 400; horizontal-alignment: center; vertical-alignment: center; }
+                                        }
+                                    }
+                                    Text { text: service.ports == "" ? "—" : service.ports; width: ServiceColumns.ports; color: #63708b; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; wrap: word-wrap; }
+                                    Rectangle { width: ServiceColumns.state;
+                                        Rectangle { width: 76px; height: 26px; x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; border-radius: 13px; background: service.state == "异常" ? #fff0f0 : service.state == "运行中" ? #e9f7f0 : service.running ? #fff5df : #f0f3f8;
+                                            Text { text: service.state; color: service.state == "异常" ? #be4753 : service.state == "运行中" ? #20835c : service.running ? #926512 : #63708b; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
+                                        }
+                                    }
+                                    Rectangle { width: ServiceColumns.actions;
+                                        HorizontalLayout { height: 34px; y: (parent.height - self.height) / 2; spacing: 8px;
+                                            Action { text: service.running ? "停止" : "启动"; width: 72px; enabled: !root.busy && (service.running ? service.can-stop : service.can-start); clicked => { root.action(service.running ? "stop" : "start", service.id); } }
+                                            Action { text: "配置"; width: 72px; enabled: !root.busy; clicked => { root.action("config", service.id); } }
+                                        }
+                                    }
+                                }
+                                Rectangle { x: ServiceColumns.inset; y: parent.height - 1px; width: parent.width - ServiceColumns.inset - ServiceColumns.trailing-inset; height: 1px; background: #edf0f6; }
+                                ContextMenuArea { Menu {
+                                    MenuItem { title: "启动"; enabled: !root.busy && service.can-start; activated => { root.action("start", service.id); } }
+                                    MenuItem { title: "停止"; enabled: !root.busy && service.can-stop; activated => { root.action("stop", service.id); } }
+                                    MenuItem { title: "重启"; enabled: !root.busy && service.can-stop; activated => { root.action("restart", service.id); } }
+                                    MenuItem { title: "重加载配置（Apache）"; enabled: !root.busy && service.id == "apache" && service.running; activated => { root.action("reload", service.id); } }
+                                    MenuSeparator { }
+                                    MenuItem { title: "编辑配置"; enabled: !root.busy; activated => { root.action("config", service.id); } }
+                                    MenuItem { title: "查看日志"; enabled: !root.busy; activated => { root.action("log", service.id); } }
+                                } }
+                            }
+                            Rectangle { vertical-stretch: 1; }
+                        } }
+                    }
+                }
+                HorizontalLayout { height: 28px; Label { text: "右键服务行可重启、重加载或查看日志"; font-size: 11px; } Rectangle { horizontal-stretch: 1; } Action { text: "组件详情"; width: 100px; height: 28px; enabled: !root.busy; clicked => { root.action("packages", ""); } } }
+            }
+            if root.page == 1 : HorizontalLayout { spacing: 16px;
+                Rectangle { width: 240px; background: #ffffff; border-radius: 10px; border-width: 1px; border-color: #e5eaf3;
+                    VerticalLayout { padding: 14px; spacing: 10px;
+                        Action { text: "+ 新建项目"; primary: true; enabled: !root.busy; clicked => { root.select-project(-1); } }
+                        LineEdit { placeholder-text: "搜索名称、路径或分组"; text <=> root.project-search; edited => { root.action("project-filter", ""); } }
+                        HorizontalLayout { spacing: 4px;
+                            for title[index] in ["全部", "共享", "本机"] : Action { text: title; min-width: 54px; selected: root.project-filter == index; clicked => { root.project-filter = index; root.action("project-filter", ""); } }
+                        }
+                        ScrollView { VerticalLayout { spacing: 0px;
+                            for project[index] in root.projects : Rectangle {
+                                visible: project.visible; height: project.visible ? 62px : 0px; border-radius: 7px; background: root.project-index == index ? #eef0ff : #ffffff;
+                                VerticalLayout { padding: 10px; spacing: 5px; Text { text: project.name; color: project.enabled ? #34415e : #96a0b2; font-weight: 600; overflow: elide; } Label { text: project.domain; font-size: 10px; overflow: elide; } }
+                                TouchArea { clicked => { root.select-project(index); } }
+                            }
+                            Rectangle { vertical-stretch: 1; }
+                        } }
+                        Label { text: "批量操作当前筛选结果"; font-size: 10px; }
+                        HorizontalLayout { spacing: 5px;
+                            Action { text: "开启共享"; enabled: !root.busy; clicked => { root.action("projects-share", ""); } }
+                            Action { text: "取消共享"; enabled: !root.busy; clicked => { root.action("projects-local", ""); } }
+                        }
+                        Action { text: "打开项目导航页"; enabled: !root.busy; clicked => { root.action("portal-open", ""); } }
+                        Action { text: "复制导航页地址"; enabled: !root.busy; clicked => { root.action("portal-copy", ""); } }
+                    }
+                }
+                Rectangle { background: #ffffff; border-radius: 10px; border-width: 1px; border-color: #e5eaf3;
+                    VerticalLayout { padding: 18px; spacing: 12px;
+                        Heading { text: root.project-index < 0 ? "新建项目" : "项目设置"; }
+                        ScrollView { VerticalLayout { spacing: 12px;
+                            HorizontalLayout { spacing: 12px;
+                                FormField { enabled: !root.busy; label: "项目名称"; value <=> root.project-name; placeholder: "例如：后台管理"; }
+                                FormField { enabled: !root.busy; label: "访问标识"; value <=> root.project-id; placeholder: "project-c"; }
+                            }
+                            FormField { enabled: !root.busy; label: "分组（可选）"; value <=> root.project-group; placeholder: "例如：业务系统"; }
+                            VerticalLayout { spacing: 6px;
+                                Label { text: "项目目录"; }
+                                HorizontalLayout { spacing: 10px;
+                                    LineEdit { enabled: !root.busy; text <=> root.project-directory; placeholder-text: "本机绝对路径，或相对于环境根目录"; horizontal-stretch: 1; }
+                                    Action { text: "选择目录"; width: 104px; enabled: !root.busy; clicked => { root.choose-directory("project", -1); } }
+                                }
+                            }
+                            FormField { enabled: !root.busy; label: "网站入口目录（相对于项目目录）"; value <=> root.project-docroot; placeholder: "webroot / app/webroot / public"; }
+                            VerticalLayout { spacing: 6px; Label { text: "PHP 版本"; } VersionChoice { enabled: !root.busy; text: root.php-options[root.project-php]; clicked => { root.open-picker("project", -1); } } }
+                            HorizontalLayout { spacing: 10px;
+                                CheckBox { enabled: !root.busy; text: "启用项目访问"; checked <=> root.project-enabled; }
+                                CheckBox { enabled: !root.busy; text: "允许局域网访问"; checked <=> root.project-lan; }
+                            }
+                            CheckBox { enabled: !root.busy; text: "在导航页展示"; checked <=> root.project-listed; }
+                            CheckBox { enabled: !root.busy; text: "启用域名虚拟主机"; checked <=> root.project-virtual-host; }
+                            if root.project-virtual-host : FormField { enabled: !root.busy; label: "访问域名"; value <=> root.project-domain; placeholder: "my-app.localhost"; }
+                            Label { text: "访问路径：/" + root.project-id + "/"; wrap: word-wrap; }
+                            Label { text: "从列表移除项目会保留项目文件。"; font-size: 10px; }
+                            Rectangle { vertical-stretch: 1; }
+                        } }
+                        HorizontalLayout { spacing: 6px;
+                            Action { text: "移除项目"; danger: true; enabled: !root.busy && root.project-index >= 0; clicked => { root.action("project-remove", ""); } }
+                            Rectangle { horizontal-stretch: 1; }
+                            Action { text: "复制地址"; enabled: !root.busy && root.project-index >= 0; clicked => { root.action("project-copy", ""); } }
+                            Action { text: "打开站点"; enabled: !root.busy && root.project-index >= 0; clicked => { root.action("project-open", ""); } }
+                            Action { text: "保存并应用"; primary: true; enabled: !root.busy; clicked => { root.action("project-save", ""); } }
+                        }
+                    }
+                }
+            }
+            if root.page == 2 : VerticalLayout { spacing: 12px;
+                ScrollView { VerticalLayout { spacing: 16px;
+                    Rectangle { background: #ffffff; border-radius: 10px; border-width: 1px; border-color: #e5eaf3; min-height: 196px;
+                        VerticalLayout { padding: 20px; spacing: 10px;
+                            HorizontalLayout { spacing: 12px;
+                                Heading { text: "启动设置"; horizontal-stretch: 1; }
+                                Action { text: "保存启动设置"; width: 112px; enabled: !root.busy; clicked => { root.action("startup-save", ""); } }
+                            }
+                            CheckBox { text: "开机启动 Flaragon（当前用户登录 Windows 时）"; checked <=> root.launch-at-login; enabled: !root.busy; }
+                            CheckBox { text: "软件启动后自动启动常用服务"; checked <=> root.start-common-services; enabled: !root.busy; }
+                            Label { text: "两个开关独立；常用服务自启也适用于手动打开软件，从下次启动起生效。"; font-size: 11px; wrap: word-wrap; }
+                            if root.startup-failed || root.startup-dirty || root.startup-status != "" : Text { text: root.startup-failed ? root.startup-status : root.startup-dirty ? "启动设置尚未保存，请点击“保存启动设置”。" : root.startup-status; color: root.startup-failed ? #b43c48 : #63708b; font-size: 11px; wrap: word-wrap; }
+                        }
+                    }
+                    Rectangle { background: #ffffff; border-radius: 10px; border-width: 1px; border-color: #e5eaf3; height: 246px;
+                        VerticalLayout { padding: 20px; spacing: 10px;
+                            HorizontalLayout { spacing: 12px; Heading { text: "网站服务与默认 PHP"; } Rectangle {} Label { text: root.apache-locked ? "运行中，停止后可修改" : ""; } Action { text: "打开服务目录"; width: 104px; clicked => { root.action("service-directory", "apache"); } } }
+                            HorizontalLayout { spacing: 12px;
+                                VerticalLayout { horizontal-stretch: 1; Label { text: "Apache"; } VersionChoice { enabled: !root.busy && !root.apache-locked; text: root.apache-options[root.apache-index]; clicked => { root.open-picker("apache", -1); } } }
+                                VerticalLayout { Label { text: "使用方式"; } UsageChoice { enabled: !root.busy && !root.apache-locked; current-index <=> root.apache-usage; } }
+                                VerticalLayout { Label { text: "项目入口端口"; } LineEdit { width: 112px; enabled: !root.busy && !root.apache-locked; text <=> root.http-port; } }
+                            }
+                            HorizontalLayout { spacing: 12px; Label { text: "项目监听地址"; width: 90px; } LineEdit { text <=> root.http-address; enabled: !root.busy && !root.apache-locked; horizontal-stretch: 1; } Action { text: "选择地址"; width: 104px; enabled: !root.busy && !root.apache-locked; clicked => { root.open-picker("http-address", -1); } } }
+                            Label { text: "127.0.0.1 仅本机；选择本机网卡 IPv4 地址用于局域网。"; font-size: 10px; }
+                            HorizontalLayout { spacing: 12px; Label { text: "默认 PHP"; width: 80px; } VersionChoice { enabled: !root.busy && !root.apache-locked; text: root.default-php-options[root.default-php-index]; horizontal-stretch: 1; clicked => { root.open-picker("default-php", -1); } } }
+                        }
+                    }
+                    Rectangle { background: #ffffff; border-radius: 10px; border-width: 1px; border-color: #e5eaf3; height: 84px + root.php-settings.length * 244px;
+                        VerticalLayout { padding: 20px; spacing: 10px;
+                            HorizontalLayout { Heading { text: "PHP 运行设置"; } Rectangle {} Action { text: "打开服务目录"; width: 104px; clicked => { root.action("service-directory", "php"); } } }
+                            for php[index] in root.php-settings : Rectangle { height: 234px; border-radius: 6px; background: #f7f8fb;
+                                VerticalLayout { padding: 12px; spacing: 12px;
+                                    HorizontalLayout { spacing: 12px;
+                                        Text { text: php.name; color: #4d5c77; horizontal-stretch: 1; vertical-alignment: center; overflow: elide; }
+                                        Label { text: php.locked ? "运行中，停止后可修改" : ""; }
+                                    }
+                                    HorizontalLayout { height: 32px; spacing: 24px;
+                                        HorizontalLayout { spacing: 8px; Label { text: "使用方式"; } UsageChoice { enabled: !root.busy && !php.locked; current-index <=> php.usage; } }
+                                        HorizontalLayout { spacing: 8px; Label { text: "内部起始端口"; } LineEdit { enabled: !root.busy && !php.locked; text <=> php.port; width: 112px; } }
+                                        HorizontalLayout { spacing: 8px; Label { text: "进程数"; } LineEdit { enabled: !root.busy && !php.locked; text <=> php.workers; width: 80px; } }
+                                        Rectangle { horizontal-stretch: 1; }
+                                    }
+                                    HorizontalLayout { spacing: 12px;
+                                        CheckBox { text: "启用目录入口"; checked <=> php.directory-enabled; enabled: !root.busy && !root.apache-locked && !php.locked; }
+                                        Label { text: "HTTP 端口"; }
+                                        LineEdit { text <=> php.directory-port; placeholder-text: "例如 8074"; width: 112px; enabled: !root.busy && !root.apache-locked && !php.locked; }
+                                        Rectangle { horizontal-stretch: 1; }
+                                    }
+                                    HorizontalLayout { spacing: 10px; Label { text: "根目录"; width: 56px; } LineEdit { text <=> php.directory-root; placeholder-text: "本机绝对路径，或相对于环境根目录"; enabled: !root.busy && !root.apache-locked && !php.locked; horizontal-stretch: 1; } Action { text: "选择目录"; width: 104px; enabled: !root.busy && !root.apache-locked && !php.locked; clicked => { root.choose-directory("php", index); } } }
+                                    HorizontalLayout { spacing: 10px; Label { text: "监听地址"; width: 56px; } LineEdit { text <=> php.directory-address; enabled: !root.busy && !root.apache-locked && !php.locked; horizontal-stretch: 1; } Action { text: "选择地址"; width: 104px; enabled: !root.busy && !root.apache-locked && !php.locked; clicked => { root.open-picker("directory-address", index); } } }
+                                }
+                            }
+                        }
+                    }
+                    Rectangle { background: #ffffff; border-radius: 10px; border-width: 1px; border-color: #e5eaf3; height: 128px + root.mysql-settings.length * 100px;
+                        VerticalLayout { padding: 20px; spacing: 10px;
+                            HorizontalLayout { spacing: 12px; Heading { text: "MySQL 服务"; } Rectangle { horizontal-stretch: 1; } Action { text: "打开服务目录"; width: 104px; clicked => { root.action("service-directory", "mysql"); } } Action { text: "+ 添加服务"; width: 104px; enabled: !root.busy; clicked => { root.settings-row("add", -1); } } }
+                            HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 8px; height: 24px;
+                                Label { text: "使用方式"; width: 144px; horizontal-alignment: center; }
+                                Label { text: "数据目录名称"; width: 104px; }
+                                Label { text: "MySQL 版本"; horizontal-stretch: 1; }
+                                Label { text: "端口"; width: 112px; }
+                                Label { text: "操作"; width: 76px; horizontal-alignment: center; }
+                            }
+                            for db[index] in root.mysql-settings : Rectangle { height: 90px; border-radius: 6px; background: db.fresh ? #eef4ff : #f7f8fb;
+                                VerticalLayout { padding: 8px; spacing: 5px;
+                                    HorizontalLayout { height: 32px; spacing: 8px;
+                                        UsageChoice { enabled: !root.busy && !db.locked; current-index <=> db.usage; }
+                                        LineEdit { enabled: !root.busy && !db.locked && db.fresh; text <=> db.name; placeholder-text: "例如 demo"; width: 104px; edited => { root.settings-row("inspect", index); } }
+                                        VersionChoice { enabled: !root.busy && !db.locked && db.fresh; text: root.mysql-package-options[db.package-index]; horizontal-stretch: 1; clicked => { root.open-picker("mysql", index); } }
+                                        LineEdit { enabled: !root.busy && !db.locked; text <=> db.port; width: 112px; }
+                                        Action { text: db.fresh ? "取消新增" : "移除"; width: 76px; enabled: !root.busy && !db.locked; clicked => { root.settings-row("remove", index); } }
+                                    }
+                                    HorizontalLayout { spacing: 12px;
+                                        Text { text: db.hint; color: !db.valid || (db.fresh && db.exists) ? #bc3344 : #7a879b; font-size: 10px; wrap: word-wrap; horizontal-stretch: 1; }
+                                        Text { text: db.locked ? "运行中 · 已锁定" : db.fresh ? "新增 · 未保存" : "已停止"; color: db.fresh ? #3563b5 : #63708b; font-size: 10px; width: 88px; vertical-alignment: center; }
+                                    }
+                                }
+                            }
+                            if root.mysql-settings.length == 0 : Label { text: "暂无 MySQL 服务，点击“添加服务”创建。"; }
+                        }
+                    }
+                    Rectangle { background: #ffffff; border-radius: 10px; border-width: 1px; border-color: #e5eaf3; height: 128px;
+                        VerticalLayout { padding: 20px; spacing: 12px;
+                            HorizontalLayout { spacing: 12px; Heading { text: "Redis"; } Rectangle {} Label { text: root.redis-locked ? "运行中，停止后可修改" : root.has-redis ? "" : "尚未发现 Redis 组件"; } Action { text: "打开服务目录"; width: 104px; clicked => { root.action("service-directory", "redis"); } } }
+                            HorizontalLayout { spacing: 10px;
+                                Label { text: "使用方式"; width: 60px; } UsageChoice { enabled: root.has-redis && !root.busy && !root.redis-locked; current-index <=> root.redis-usage; }
+                                Rectangle {} Label { text: "端口"; width: 40px; } LineEdit { text <=> root.redis-port; enabled: root.has-redis && !root.busy && !root.redis-locked; width: 112px; }
+                            }
+                        }
+                    }
+                } }
+                HorizontalLayout { spacing: 8px; height: 36px;
+                    Action { text: "域名映射"; width: 100px; enabled: !root.busy; clicked => { root.action("hosts", ""); } }
+                    Rectangle { horizontal-stretch: 1; }
+                    Action { text: "撤销未保存的修改"; width: 136px; enabled: !root.busy; clicked => { root.action("settings-reset", ""); } }
+                    Action { text: "应用设置"; width: 100px; primary: true; enabled: !root.busy; clicked => { root.action("settings-save", ""); } }
+                }
+            }
+            Rectangle { height: 56px; background: root.failed ? #fff1f1 : #edf1f8; border-radius: 7px;
+                VerticalLayout { padding: 10px; spacing: 4px;
+                    Text { text: root.busy ? "正在处理，请稍候…" : root.status; color: root.failed ? #b43c48 : #576780; font-size: 11px; overflow: elide; }
+                    Text { text: root.environment; color: #8e9aaf; font-size: 10px; overflow: elide; }
+                }
+                TouchArea { clicked => { if root.failed { root.action("error-detail", ""); } } }
+            }
+        }
+    }
+}
