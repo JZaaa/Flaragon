@@ -194,7 +194,7 @@ fn interrupted_path_update_restores_before_retry() {
     let journal = serde_json::json!([{"path":"config/app.json", "before":before, "after":b"interrupted write"}]);
     atomic_write(
         &layout.path("runtime/state/path-update.json").unwrap(),
-        &serde_json::to_vec(&journal).unwrap(),
+        &platform::secrets::seal(&serde_json::to_vec(&journal).unwrap()).unwrap(),
     )
     .unwrap();
     assert!(relocation::check(&layout).unwrap().moved);
@@ -205,6 +205,63 @@ fn interrupted_path_update_restores_before_retry() {
             .unwrap()
             .exists()
     );
+}
+
+#[test]
+fn redis_password_is_preserved_on_relocation_and_backups_are_protected() {
+    let layout = environment();
+    let old = old_root(&layout);
+    seed(&layout, &old);
+    let password = format!(
+        "{}/{}",
+        apache_path(&old).unwrap(),
+        platform::random_token().unwrap()
+    );
+    let head = format!(
+        "dir \"{}/data/redis\"\n",
+        apache_path(&layout.root).unwrap()
+    );
+    let candidate = layout.path("runtime/generated/redis.conf").unwrap();
+    service_config::prepare(
+        &layout,
+        "redis",
+        Kind::Redis,
+        &head,
+        "",
+        &format!("requirepass \"{password}\"\n"),
+        &candidate,
+        None,
+    )
+    .unwrap();
+    let file = service_config::commit(&layout, "redis", &candidate).unwrap();
+    for path in [&file, &file.with_extension("managed.json")] {
+        let text = fs::read_to_string(path).unwrap();
+        atomic_write(
+            path,
+            relocation::rebase_text(&text, &layout.root, &old).as_bytes(),
+        )
+        .unwrap();
+    }
+    assert!(relocation::check(&layout).unwrap().moved);
+    let text = fs::read_to_string(file).unwrap();
+    assert_eq!(
+        flaragon::redis_config::password(&text).unwrap(),
+        password.as_bytes()
+    );
+    assert!(text.contains(&apache_path(&layout.root).unwrap()));
+    for entry in fs::read_dir(layout.path("runtime/path-backups").unwrap()).unwrap() {
+        let data = fs::read(entry.unwrap().path().join("changes.json")).unwrap();
+        assert!(data.starts_with(b"FLARAGON-DPAPI-1\0"));
+        assert!(
+            !data
+                .windows(password.len())
+                .any(|w| w == password.as_bytes())
+        );
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&platform::secrets::open(&data).unwrap())
+                .is_ok()
+        );
+    }
 }
 
 #[test]

@@ -349,7 +349,7 @@ fn commit(layout: &Layout, changes: &[Change]) -> Result<()> {
         return Ok(());
     }
     let journal = layout.path(JOURNAL)?;
-    let bytes = serde_json::to_vec(changes)?;
+    let bytes = crate::platform::secrets::seal(&serde_json::to_vec(changes)?)?;
     ensure!(bytes.len() <= 32 * 1024 * 1024, "路径更新记录超过大小上限");
     let backup = layout.path(format!(
         "runtime/path-backups/{}/changes.json",
@@ -406,8 +406,8 @@ fn stage(
 
 pub fn check(layout: &Layout) -> Result<Report> {
     if let Some(bytes) = read_optional(layout, JOURNAL)? {
-        let changes: Vec<Change> =
-            serde_json::from_slice(&bytes).context("路径更新恢复记录损坏")?;
+        let changes: Vec<Change> = serde_json::from_slice(&crate::platform::secrets::open(&bytes)?)
+            .context("路径更新恢复记录损坏")?;
         for change in &changes {
             ensure!(allowed(&change.path), "路径恢复记录越界");
             layout.path(&change.path)?;
@@ -469,6 +469,20 @@ pub fn check(layout: &Layout) -> Result<Report> {
                 } else {
                     serde_json::to_vec_pretty(&value)?
                 }
+            } else if path.starts_with("config/services/redis")
+                || path == Path::new("config/overrides/redis.conf")
+            {
+                text.split_inclusive('\n')
+                    .map(|line| {
+                        if crate::redis_config::directive(line).eq_ignore_ascii_case("requirepass")
+                        {
+                            line.to_owned()
+                        } else {
+                            rebase_text(line, &old, &layout.root)
+                        }
+                    })
+                    .collect::<String>()
+                    .into_bytes()
             } else {
                 rebase_text(text, &old, &layout.root).into_bytes()
             };

@@ -31,6 +31,8 @@ struct Record {
     identity: Identity,
     ports: Vec<u16>,
     config: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    redis_auth: Option<Vec<u8>>,
 }
 struct Running {
     record: Record,
@@ -563,7 +565,11 @@ impl Engine {
         let before = fs::read(&file)?;
         atomic_write(
             &self.layout.path(file.with_extension("before-edit"))?,
-            &before,
+            &if id == "redis" {
+                platform::secrets::seal(&before)?
+            } else {
+                before.clone()
+            },
         )?;
         atomic_write(&file, text.as_bytes())?;
         let candidate = self.config.clone();
@@ -841,6 +847,13 @@ impl Engine {
         let log = self
             .layout
             .path(format!("logs/{}.log", id.replace(':', "-")))?;
+        let redis_auth = if kind == Kind::Redis {
+            Some(platform::secrets::seal(&crate::redis_config::password(
+                &fs::read_to_string(&config)?,
+            )?)?)
+        } else {
+            None
+        };
         let process = Process::from_child(platform::spawn_logged(&mut cmd, &log)?)?;
         let record = Record {
             id: id.into(),
@@ -848,6 +861,7 @@ impl Engine {
             identity: process.identity.clone(),
             ports,
             config,
+            redis_auth,
         };
         self.running
             .entry(id.into())
@@ -918,7 +932,18 @@ impl Engine {
                             p.process.owns_port(p.record.ports[0])?,
                             "Redis 端口不属于本实例，拒绝关闭"
                         );
-                        let response = protocol::redis(p.record.ports[0], &["SHUTDOWN"]);
+                        let password = p
+                            .record
+                            .redis_auth
+                            .as_deref()
+                            .map(platform::secrets::open)
+                            .transpose()?
+                            .unwrap_or_default();
+                        let response = protocol::redis_authenticated(
+                            p.record.ports[0],
+                            &password,
+                            &["SHUTDOWN"],
+                        );
                         if let Err(e) = response
                             && p.process.running()
                         {
@@ -1103,7 +1128,7 @@ impl Engine {
         let applied_files = self
             .applied_files
             .iter()
-            .map(|(path, bytes)| Ok((self.layout.relative(path)?, bytes.clone())))
+            .map(|(path, bytes)| Ok((self.layout.relative(path)?, platform::secrets::seal(bytes)?)))
             .collect::<Result<BTreeMap<_, _>>>()?;
         let applied = self
             .applied
@@ -1143,7 +1168,8 @@ impl Engine {
                     || checked.starts_with(self.layout.path("config/services")?),
                 "运行配置快照路径无效"
             );
-            self.applied_files.insert(checked, bytes);
+            self.applied_files
+                .insert(checked, platform::secrets::open(&bytes)?);
         }
         for mut record in state.records {
             record.identity.executable = self.layout.path(&record.identity.executable)?;
@@ -1361,6 +1387,7 @@ impl Engine {
                         identity: process.identity.clone(),
                         ports: vec![],
                         config: conf.clone(),
+                        redis_auth: None,
                     },
                     process,
                 });
@@ -1460,7 +1487,14 @@ impl Engine {
                 process.process.owns_port(spec.port)?,
                 "Redis 监听者已变化，停止健康探测"
             );
-            match protocol::redis(spec.port, &["PING"]) {
+            let password = process
+                .record
+                .redis_auth
+                .as_deref()
+                .map(platform::secrets::open)
+                .transpose()?
+                .unwrap_or_default();
+            match protocol::redis_authenticated(spec.port, &password, &["PING"]) {
                 Ok(response) if response.starts_with("+PONG") => break,
                 Err(error)
                     if error.to_string().contains("LOADING")

@@ -19,6 +19,7 @@ use windows_sys::Win32::{
 };
 
 pub mod deployment;
+pub mod secrets;
 pub(crate) mod startup;
 
 pub fn wide(s: impl AsRef<OsStr>) -> Vec<u16> {

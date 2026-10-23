@@ -1,4 +1,5 @@
 """Validate the repair EXE against fresh original installations inside the workspace."""
+import argparse
 import importlib.util
 import json
 import os
@@ -14,16 +15,22 @@ checked = builder.checked
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--repair', type=Path, required=True)
+    args = parser.parse_args()
     assert os.environ.get('FLARAGON_DEV_ROOT', '').lower() == str(ROOT).lower()
-    repair = checked(ROOT / 'dist/repairs/php-version-0.0.1')
+    repair = checked(args.repair.absolute())
     update = checked(repair / 'update.exe')
-    setup = checked(ROOT / 'dist/0.0.1/Flaragon-Setup-0.0.1-x64.exe')
-    original_manifest = json.loads(checked(ROOT / 'dist/0.0.1/release.json').read_bytes())
     manifest = json.loads(checked(repair / 'release.json').read_bytes())
+    version = manifest['version']
+    release = checked(ROOT / 'dist' / version)
+    setup = checked(release / f'Flaragon-Setup-{version}-x64.exe')
+    original_manifest = json.loads(checked(release / 'release.json').read_bytes())
+    assert json.loads(checked(repair / 'payload/repair-base.json').read_bytes()) == original_manifest
     base = checked(ROOT / 'testwork' / ('repair-' + uuid.uuid4().hex[:12]))
     base.mkdir()
     original_update = checked(base / 'ordinary-update.exe')
-    original_files = {name: checked(ROOT / 'dist/0.0.1/payload' / name).read_bytes()
+    original_files = {name: checked(release / 'payload' / name).read_bytes()
                       for name in [*original_manifest['files'], 'release.json']}
     builder.write_package(
         checked(ROOT / 'target/x86_64-pc-windows-msvc/release/flaragon-deploy.exe').read_bytes(),
@@ -108,7 +115,7 @@ def main():
     results.append('Real repair EXE completes an interrupted transaction with a replaced main executable')
     evidence = dict(product_version=manifest['version'], official_release=False, repair=str(update),
         gui_target=str(gui), fixture_root=str(base), results=results, stopped=True)
-    path = checked(ROOT / 'testwork/evidence/repair.json')
+    path = checked(ROOT / 'testwork/evidence' / ('repair-' + repair.name + '.json'))
     path.write_text(json.dumps(evidence, ensure_ascii=False, indent=2), encoding='utf-8')
     print(json.dumps(evidence, ensure_ascii=False, indent=2))
 

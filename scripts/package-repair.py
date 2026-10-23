@@ -1,7 +1,9 @@
-"""Build an explicitly requested same-version PHP-version repair, without changing release archives."""
+"""Build an explicitly requested same-version repair without changing release archives."""
+import argparse
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import tomllib
@@ -15,18 +17,25 @@ checked = builder.checked
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--repair-id', required=True)
+    parser.add_argument('--description', required=True)
+    args = parser.parse_args()
     assert os.environ.get('FLARAGON_DEV_ROOT', '').lower() == str(ROOT).lower()
     version = tomllib.loads(checked(ROOT / 'Cargo.toml').read_text(encoding='utf-8'))['package']['version']
-    assert version == '0.0.1', 'This repair targets the original 0.0.1 installation only'
-    release = checked(ROOT / 'dist/0.0.1')
+    assert re.fullmatch(r'[a-z][a-z0-9.-]{0,79}', args.repair_id), 'Invalid repair identifier'
+    assert args.repair_id.endswith('-' + version), 'Repair identifier must end with the product version'
+    assert args.description.strip(), 'A repair description is required'
+    release = checked(ROOT / 'dist' / version)
     base_bytes = checked(release / 'release.json').read_bytes()
     base = json.loads(base_bytes)
+    assert base['version'] == version and base['product'] == 'Flaragon', 'Baseline product/version mismatch'
     files = {name: checked(release / 'payload' / name).read_bytes() for name in base['files']}
     assert all(len(files[name]) == size for name, size in base['files'].items())
     main_exe = checked(ROOT / 'target/x86_64-pc-windows-msvc/release/Flaragon.exe').read_bytes()
     assert main_exe != files['Flaragon.exe'], 'Repair must contain a changed program'
     files['Flaragon.exe'] = main_exe
-    output = checked(ROOT / 'dist/repairs/php-version-0.0.1')
+    output = checked(ROOT / 'dist/repairs' / args.repair_id)
     # An existing repair is immutable; reruns may only reproduce its exact payload.
     previous = json.loads(checked(output / 'release.json').read_text(encoding='utf-8')) if output.exists() else None
     manifest = dict(base, release_id=previous['release_id'] if previous else uuid.uuid4().hex,
@@ -52,9 +61,9 @@ def main():
     builder.write_package(stub, payload, output / 'update.exe', 2)
     checked(output / 'release.json').write_bytes(files['release.json'])
     checked(output / 'build-info.json').write_text(json.dumps(dict(
-        purpose='PHP complete runtime version repair', product_version=version,
+        purpose=args.description, product_version=version, repair_id=args.repair_id,
         base_release_id=base['release_id'], repair_build_id=manifest['release_id'],
-        source='Cargo.lock and project release build; original 0.0.1 editor DLLs and licenses',
+        source=f'Cargo.lock and project release build; original {version} editor DLLs and licenses',
         official_release=False, signed=False), indent=2), encoding='utf-8')
     print(output / 'update.exe')
 

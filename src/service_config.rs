@@ -208,7 +208,12 @@ pub fn commit(layout: &Layout, id: &str, candidate: &Path) -> Result<PathBuf> {
     };
     if old.as_ref() != Some(&candidate_bytes) {
         if let Some(bytes) = &old {
-            atomic_write(&layout.path(file.with_extension("backup"))?, bytes)?;
+            let backup = if id == "redis" {
+                crate::platform::secrets::seal(bytes)?
+            } else {
+                bytes.clone()
+            };
+            atomic_write(&layout.path(file.with_extension("backup"))?, &backup)?;
         }
         atomic_write(&file, &candidate_bytes)?;
     }
@@ -233,13 +238,16 @@ pub fn snapshot(layout: &Layout, id: &str) -> Result<Vec<(PathBuf, Vec<u8>)>> {
 /// Native scalar directives are accepted; instance ownership and indirect file execution stay explicit.
 pub fn validate_user(layout: &Layout, kind: Kind, text: &str) -> Result<()> {
     ensure!(!text.contains('\0'), "配置含空字符");
+    if kind == Kind::Redis {
+        crate::redis_config::password(text)?;
+    }
     for (index, raw) in text.lines().enumerate() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with([';', '#']) {
             continue;
         }
         let key = line
-            .split(['=', ' ', '\t'])
+            .split(|c: char| c == '=' || c.is_ascii_whitespace() || c == '\u{b}')
             .next()
             .unwrap_or("")
             .to_ascii_lowercase()
@@ -315,7 +323,6 @@ pub fn validate_user(layout: &Layout, kind: Kind, text: &str) -> Result<()> {
                 "cluster-enabled",
                 "cluster-config-file",
                 "loadmodule",
-                "requirepass",
                 "masterauth",
                 "aclfile",
                 "user",
@@ -347,6 +354,9 @@ pub fn validate_user(layout: &Layout, kind: Kind, text: &str) -> Result<()> {
             index + 1,
             key
         );
+        if kind == Kind::Redis && key == "requirepass" {
+            continue;
+        }
         ensure!(
             !line.contains("${")
                 && !line.ends_with('\\')

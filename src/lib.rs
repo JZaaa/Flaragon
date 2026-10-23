@@ -7,6 +7,7 @@ pub mod hosts;
 pub mod mysql_data;
 pub mod platform;
 pub mod protocol;
+pub mod redis_config;
 pub mod relocation;
 pub mod service_config;
 pub mod startup;

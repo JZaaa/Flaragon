@@ -252,7 +252,7 @@ export component MainWindow inherits Window {
         VerticalLayout { padding: 26px; spacing: 18px;
             HorizontalLayout { height: 36px; spacing: 14px;
                 Heading { text: root.page == 0 ? "服务管理" : root.page == 1 ? "项目管理" : "环境设置"; font-size: 25px; horizontal-stretch: 1; vertical-alignment: center; }
-                if root.page == 0 : Action { width: 100px; text: "刷新组件"; enabled: !root.busy; clicked => { root.action("scan", ""); } }
+                if root.page == 0 || root.page == 2 : Action { width: 100px; text: "刷新组件"; enabled: !root.busy; clicked => { root.action("scan", ""); } }
             }
             if root.page == 0 : VerticalLayout { spacing: 16px;
                 HorizontalLayout { height: 80px; spacing: 12px;

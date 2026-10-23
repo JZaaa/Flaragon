@@ -99,7 +99,12 @@ fn rejects_managed_changes_and_external_references_before_component_execution() 
         (Kind::Mysql, "!include outside.ini"),
         (Kind::Mysql, "port=3306"),
         (Kind::Redis, "dir ../outside"),
+        (Kind::Redis, "bind\u{b}127.0.0.1"),
         (Kind::Redis, "replicaof 127.0.0.1 6379"),
+        (Kind::Redis, "user default on nopass"),
+        (Kind::Redis, "rename-command SHUTDOWN disabled"),
+        (Kind::Redis, "aclfile other.conf"),
+        (Kind::Redis, "masterauth placeholder"),
         (Kind::Apache, "Include D:/outside/httpd.conf"),
         (Kind::Apache, "CustomLog |outside.exe common"),
     ] {
@@ -112,6 +117,7 @@ fn rejects_managed_changes_and_external_references_before_component_execution() 
         (Kind::Php, "[PHP]\n; 原生参数\nprecision=12"),
         (Kind::Mysql, "[mysqld]\nconnect_timeout=17"),
         (Kind::Redis, "hz 13"),
+        (Kind::Redis, "requirepass \"example /|${} 中文\""),
         (Kind::Apache, "ServerTokens Prod"),
     ] {
         native::validate_user(&layout, kind, text).expect("ordinary native options");

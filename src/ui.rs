@@ -277,6 +277,9 @@ impl State {
             .collect();
         ui.set_service_counts(model(counts));
         self.snapshot = Some(s);
+        if !initial {
+            self.refresh_components(ui);
+        }
         self.refresh_locks(ui);
         if initial {
             self.load_draft(ui);
@@ -285,6 +288,125 @@ impl State {
         if let Some(error) = error {
             self.fail(ui, error);
         }
+    }
+    fn refresh_components(&mut self, ui: &MainWindow) {
+        let (Some(latest), Some(draft)) = (&self.snapshot, &mut self.draft) else {
+            return;
+        };
+        // Stable package order preserves every open selector and unsaved row's index.
+        // Editable text is copied only for newly discovered services, never for existing rows.
+        let changed = latest.packages.iter().any(|p| {
+            draft
+                .packages
+                .iter()
+                .find(|d| d.id == p.id)
+                .is_none_or(|d| serde_json::to_value(p).ok() != serde_json::to_value(d).ok())
+        }) || draft.packages.iter().any(|d| {
+            !latest.packages.iter().any(|p| p.id == d.id)
+                && d.error.as_deref() != Some("组件已移除，请核对配置")
+        }) || latest.addresses != draft.addresses
+            || latest
+                .config
+                .php
+                .iter()
+                .any(|p| !draft.config.php.iter().any(|d| d.package == p.package));
+        if !changed {
+            return;
+        }
+        for package in &mut draft.packages {
+            if let Some(current) = latest.packages.iter().find(|p| p.id == package.id) {
+                *package = current.clone();
+            } else {
+                package.error = Some("组件已移除，请核对配置".into());
+            }
+        }
+        for package in &latest.packages {
+            if !draft.packages.iter().any(|p| p.id == package.id) {
+                draft.packages.push(package.clone());
+            }
+        }
+        let mut php_rows: Vec<_> = ui.get_php_settings().iter().collect();
+        for php in &latest.config.php {
+            if draft.config.php.iter().any(|p| p.package == php.package) {
+                continue;
+            }
+            draft.config.php.push(php.clone());
+            php_rows.push(PhpSetting {
+                name: label(draft, &php.package).into(),
+                id: php.package.clone().into(),
+                port: php.port.to_string().into(),
+                workers: php.workers.to_string().into(),
+                usage: php.usage.index(),
+                locked: false,
+                directory_enabled: php.directory_entry.enabled,
+                directory_port: if php.directory_entry.port == 0 {
+                    String::new()
+                } else {
+                    php.directory_entry.port.to_string()
+                }
+                .into(),
+                directory_root: php
+                    .directory_entry
+                    .directory
+                    .to_string_lossy()
+                    .into_owned()
+                    .into(),
+                directory_address: php.directory_entry.address.clone().into(),
+            });
+        }
+        if php_rows.len() != ui.get_php_settings().row_count() {
+            ui.set_php_settings(model(php_rows));
+        }
+        ui.set_default_php_options(model(
+            draft
+                .config
+                .php
+                .iter()
+                .map(|p| label(draft, &p.package).into())
+                .collect(),
+        ));
+        ui.set_php_options(model(
+            std::iter::once("使用默认 PHP".into())
+                .chain(
+                    draft
+                        .config
+                        .php
+                        .iter()
+                        .map(|p| label(draft, &p.package).into()),
+                )
+                .collect(),
+        ));
+        ui.set_apache_options(model(
+            std::iter::once("未选择".into())
+                .chain(
+                    draft
+                        .packages
+                        .iter()
+                        .filter(|p| p.kind == Kind::Apache)
+                        .map(|p| label(draft, &p.id).into()),
+                )
+                .collect(),
+        ));
+        ui.set_mysql_package_options(model(
+            draft
+                .packages
+                .iter()
+                .filter(|p| p.kind == Kind::Mysql)
+                .map(|p| label(draft, &p.id).into())
+                .collect(),
+        ));
+        if draft.config.redis.is_none()
+            && let Some(redis) = &latest.config.redis
+        {
+            draft.config.redis = Some(redis.clone());
+            ui.set_has_redis(true);
+            ui.set_redis_port(redis.port.to_string().into());
+            ui.set_redis_usage(redis.usage.index());
+        }
+        draft.addresses = latest.addresses.clone();
+        ui.set_address_options(model(
+            draft.addresses.iter().map(|a| a.as_str().into()).collect(),
+        ));
     }
     fn load_draft(&mut self, ui: &MainWindow) {
         ui.set_launch_at_login(ui.get_saved_launch_at_login());
