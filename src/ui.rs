@@ -77,6 +77,7 @@ struct State {
     mysql_generation: u64,
     mysql_dirty: Option<std::time::Instant>,
     choice_target: Option<(String, i32)>,
+    mysql_dialog: Option<MysqlAdoptWindow>,
 }
 impl State {
     fn refresh_locks(&self, ui: &MainWindow) {
@@ -390,6 +391,8 @@ impl State {
                     exists: false,
                     valid: true,
                     reuse_data: p.reuse_data,
+                    can_adopt: false,
+                    data_warning: false,
                     package_index: mysql
                         .iter()
                         .position(|a| a.id == p.package)
@@ -580,7 +583,7 @@ impl State {
                     valid_id(&name)?;
                     let mut reuse_data = row.reuse_data;
                     if row.fresh && row.exists && !reuse_data {
-                        crate::ensure!(confirm(&format!("{}\n\n确认使用此目录中的历史数据？程序不会自动升级或降级数据库。", row.hint)), "已取消使用历史数据");
+                        crate::ensure!(confirm(&format!("{}\n\n确认登记此已有数据目录？已绑定数据会按绑定检查；未绑定数据必须另行“接入数据”才能启动。保存设置不会初始化、升级或降级数据库。", row.hint)), "已取消使用历史数据");
                         reuse_data = true;
                     }
                     Ok(MysqlSpec {
@@ -739,6 +742,7 @@ pub fn run() -> Result<()> {
         mysql_generation: 0,
         mysql_dirty: None,
         choice_target: None,
+        mysql_dialog: None,
     }));
     let weak = ui.as_weak();
     let state_action = state.clone();
@@ -925,6 +929,18 @@ pub fn run() -> Result<()> {
         if let Some(ui) = weak.upgrade() {
             if ui.get_busy() { return; }
             let mut state = rows_state.borrow_mut();
+            if action == "directory" || action == "adopt" {
+                let Some(row) = ui.get_mysql_settings().row_data(index as usize) else { return };
+                if row.fresh || row.locked { return; }
+                let result = (|| -> Result<()> {
+                    let spec = state.snapshot.as_ref().and_then(|s| s.config.mysql.iter().find(|s| s.id == row.id.as_str())).context("请先保存服务")?;
+                    crate::ensure!(row.port.trim() == spec.port.to_string() && row.usage == spec.usage.index(), "请先保存或撤销此服务的设置修改");
+                    let command = if action == "directory" { Command::MysqlDirectory(row.id.to_string()) } else { Command::ReviewMysql(row.id.to_string()) };
+                    state.send(&ui, command)
+                })();
+                if let Err(error) = result { state.fail(&ui, format!("{error:#}")); }
+                return;
+            }
             if action == "inspect" {
                 let rows = ui.get_mysql_settings();
                 if let Some(mut row) = rows.row_data(index as usize) {
@@ -945,6 +961,7 @@ pub fn run() -> Result<()> {
                     id: "".into(), name: "".into(), package_index: 0, port: port.to_string().into(),
                     usage: ServiceUsage::Normal.index(), fresh: true, locked: false,
                     hint: "请输入数据目录名称".into(), exists: false, valid: false, reuse_data: false,
+                    can_adopt: false, data_warning: false,
                 });
             } else if let Some(row) = rows.get(index as usize) {
                 if row.locked { return; }
@@ -1002,6 +1019,88 @@ pub fn run() -> Result<()> {
             s.inspect_mysql_if_ready(&ui);
             for event in rx.try_iter().take(8) {
                 match event {
+                    Event::MysqlDirectory(id, result) => {
+                        s.pending = false;
+                        ui.set_busy(false);
+                        let rows = ui.get_mysql_settings();
+                        for (index, mut row) in rows.iter().enumerate() {
+                            if row.id.as_str() != id {
+                                continue;
+                            }
+                            match &result {
+                                Ok(report) => {
+                                    row.hint =
+                                        format!("{} · {}", report.path.display(), report.message)
+                                            .into();
+                                    row.can_adopt = report.can_adopt;
+                                    row.data_warning = !matches!(
+                                        report.state,
+                                        crate::mysql_data::State::Missing
+                                            | crate::mysql_data::State::Empty
+                                            | crate::mysql_data::State::Bound
+                                    );
+                                }
+                                Err(error) => {
+                                    row.hint = error.clone().into();
+                                    row.can_adopt = false;
+                                    row.data_warning = true;
+                                }
+                            }
+                            rows.set_row_data(index, row);
+                        }
+                    }
+                    Event::MysqlReview(result) => {
+                        s.pending = false;
+                        ui.set_busy(false);
+                        let result = result.map_err(|error| crate::anyhow!(error)).and_then(
+                            |review| -> Result<()> {
+                                let dialog = MysqlAdoptWindow::new()?;
+                                dialog.set_description(review.description.into());
+                                dialog.set_expected_version(review.version.into());
+                                let weak_dialog = dialog.as_weak();
+                                dialog.on_cancel(move || {
+                                    if let Some(dialog) = weak_dialog.upgrade() {
+                                        let _ = dialog.hide();
+                                    }
+                                });
+                                let weak_dialog = dialog.as_weak();
+                                let weak_main = ui.as_weak();
+                                let weak_state = Rc::downgrade(&timer_state);
+                                dialog.on_submit(move || {
+                                    let (Some(dialog), Some(ui), Some(state)) = (
+                                        weak_dialog.upgrade(),
+                                        weak_main.upgrade(),
+                                        weak_state.upgrade(),
+                                    ) else {
+                                        return;
+                                    };
+                                    let confirmation = crate::engine::MysqlAdoptionConfirmation {
+                                        token: review.token.clone(),
+                                        source_version: dialog.get_source_version().to_string(),
+                                        source_stopped: dialog.get_source_stopped(),
+                                        backup_confirmed: dialog.get_backup_confirmed(),
+                                        config_confirmed: dialog.get_config_confirmed(),
+                                    };
+                                    let _ = dialog.hide();
+                                    let mut state = state.borrow_mut();
+                                    if let Err(error) =
+                                        state.send(&ui, Command::AdoptMysql(confirmation))
+                                    {
+                                        state.fail(&ui, format!("{error:#}"));
+                                    }
+                                });
+                                if let Some(old) = s.mysql_dialog.take() {
+                                    let _ = old.hide();
+                                }
+                                dialog.show()?;
+                                s.mysql_dialog = Some(dialog);
+                                Ok(())
+                            },
+                        );
+                        if let Err(error) = result {
+                            s.fail(&ui, format!("{error:#}"));
+                        }
+                    }
                     Event::Startup(result, completed) => {
                         if completed {
                             s.pending = false;

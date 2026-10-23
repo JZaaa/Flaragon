@@ -147,6 +147,18 @@ pub fn replace_file(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
+pub fn publish_new_file(from: &Path, to: &Path) -> Result<()> {
+    let from = wide(from);
+    let to = wide(to);
+    // SAFETY: Both buffers remain valid during the call; omitting REPLACE_EXISTING preserves concurrent edits.
+    ensure!(
+        unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_WRITE_THROUGH) } != 0,
+        "无法提交新文件（目标可能已存在）：{}",
+        std::io::Error::last_os_error()
+    );
+    Ok(())
+}
+
 pub fn command(exe: &Path, root: &Path, cwd: &Path) -> Command {
     let mut cmd = Command::new(exe);
     cmd.creation_flags(CREATE_NO_WINDOW)

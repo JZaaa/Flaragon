@@ -3,7 +3,7 @@ import { CheckBox, LineEdit, ScrollView, AboutSlint } from "std-widgets.slint";
 export struct ServiceRow { id: string, name: string, subtitle: string, module: string, common: bool, state: string, ports: string, detail: string, running: bool, can-start: bool, can-stop: bool }
 export struct ProjectRow { name: string, domain: string, enabled: bool, shared: bool, visible: bool }
 export struct PhpSetting { name: string, id: string, port: string, workers: string, usage: int, locked: bool, directory-enabled: bool, directory-port: string, directory-root: string, directory-address: string }
-export struct MysqlSetting { id: string, name: string, package-index: int, port: string, usage: int, fresh: bool, locked: bool, hint: string, exists: bool, valid: bool, reuse-data: bool }
+export struct MysqlSetting { id: string, name: string, package-index: int, port: string, usage: int, fresh: bool, locked: bool, hint: string, exists: bool, valid: bool, reuse-data: bool, can-adopt: bool, data-warning: bool }
 
 global ServiceColumns {
     out property <length> usage: 80px;
@@ -460,7 +460,7 @@ export component MainWindow inherits Window {
                             }
                         }
                     }
-                    Rectangle { background: #ffffff; border-radius: 10px; border-width: 1px; border-color: #e5eaf3; height: 128px + root.mysql-settings.length * 100px;
+                    Rectangle { background: #ffffff; border-radius: 10px; border-width: 1px; border-color: #e5eaf3; height: 128px + root.mysql-settings.length * 142px;
                         VerticalLayout { padding: 20px; spacing: 10px;
                             HorizontalLayout { spacing: 12px; Heading { text: "MySQL 服务"; } Rectangle { horizontal-stretch: 1; } Action { text: "打开服务目录"; width: 104px; clicked => { root.action("service-directory", "mysql"); } } Action { text: "+ 添加服务"; width: 104px; enabled: !root.busy; clicked => { root.settings-row("add", -1); } } }
                             HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 8px; height: 24px;
@@ -470,7 +470,7 @@ export component MainWindow inherits Window {
                                 Label { text: "端口"; width: 112px; }
                                 Label { text: "操作"; width: 76px; horizontal-alignment: center; }
                             }
-                            for db[index] in root.mysql-settings : Rectangle { height: 90px; border-radius: 6px; background: db.fresh ? #eef4ff : #f7f8fb;
+                            for db[index] in root.mysql-settings : Rectangle { height: 132px; border-radius: 6px; background: db.fresh ? #eef4ff : #f7f8fb;
                                 VerticalLayout { padding: 8px; spacing: 5px;
                                     HorizontalLayout { height: 32px; spacing: 8px;
                                         UsageChoice { enabled: !root.busy && !db.locked; current-index <=> db.usage; }
@@ -480,8 +480,13 @@ export component MainWindow inherits Window {
                                         Action { text: db.fresh ? "取消新增" : "移除"; width: 76px; enabled: !root.busy && !db.locked; clicked => { root.settings-row("remove", index); } }
                                     }
                                     HorizontalLayout { spacing: 12px;
-                                        Text { text: db.hint; color: !db.valid || (db.fresh && db.exists) ? #bc3344 : #7a879b; font-size: 10px; wrap: word-wrap; horizontal-stretch: 1; }
+                                        Text { text: db.hint; color: db.data-warning || !db.valid || (db.fresh && db.exists) ? #bc3344 : #7a879b; font-size: 10px; wrap: word-wrap; horizontal-stretch: 1; }
                                         Text { text: db.locked ? "运行中 · 已锁定" : db.fresh ? "新增 · 未保存" : "已停止"; color: db.fresh ? #3563b5 : #63708b; font-size: 10px; width: 88px; vertical-alignment: center; }
+                                    }
+                                    HorizontalLayout { height: 30px; spacing: 8px;
+                                        Action { text: "检查目录"; width: 100px; enabled: !root.busy && !db.locked && !db.fresh; clicked => { root.settings-row("directory", index); } }
+                                        Action { text: "接入数据"; width: 100px; enabled: !root.busy && !db.locked && !db.fresh && db.can-adopt; clicked => { root.settings-row("adopt", index); } }
+                                        Text { text: db.fresh ? "保存服务后可检查及接入已有数据" : ""; font-size: 10px; color: #7a879b; vertical-alignment: center; }
                                     }
                                 }
                             }
@@ -512,6 +517,37 @@ export component MainWindow inherits Window {
                 }
                 TouchArea { clicked => { if root.failed { root.action("error-detail", ""); } } }
             }
+        }
+    }
+}
+
+export component MysqlAdoptWindow inherits Window {
+    title: "接入已有 MySQL 数据";
+    preferred-width: 700px; preferred-height: 570px;
+    min-width: 620px; min-height: 540px;
+    in property <string> description;
+    in property <string> expected-version;
+    in-out property <string> source-version;
+    in-out property <bool> source-stopped: false;
+    in-out property <bool> backup-confirmed: false;
+    in-out property <bool> config-confirmed: false;
+    callback submit();
+    callback cancel();
+    VerticalLayout { padding: 20px; spacing: 12px;
+        Text { text: "接入已有 MySQL 数据"; font-size: 22px; font-weight: 600; }
+        ScrollView { vertical-stretch: 1;
+            Text { text: root.description; width: parent.visible-width; wrap: word-wrap; }
+        }
+        HorizontalLayout { spacing: 10px;
+            Text { text: "来源完整版本"; vertical-alignment: center; }
+            LineEdit { text <=> root.source-version; placeholder-text: "请填写已核实的版本，例如 5.7.44"; }
+        }
+        CheckBox { text: "来源 MySQL 已正常停止，复制已完成，目录未被其他实例使用"; checked <=> root.source-stopped; }
+        CheckBox { text: "已保存独立、完整的备份，理解验证启动可能写入数据文件"; checked <=> root.backup-confirmed; }
+        CheckBox { text: "已核对原配置，确认表空间、大小写及插件设置与当前实例匹配"; checked <=> root.config-confirmed; }
+        HorizontalLayout { spacing: 10px;
+            Action { text: "取消"; clicked => { root.cancel(); } }
+            Action { text: "验证并接入"; primary: true; enabled: root.source-stopped && root.backup-confirmed && root.config-confirmed && root.source-version == root.expected-version; clicked => { root.submit(); } }
         }
     }
 }

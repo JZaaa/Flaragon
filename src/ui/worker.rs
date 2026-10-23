@@ -21,6 +21,9 @@ pub(super) enum Command {
     Settings(Config),
     Startup(crate::startup::Settings),
     InspectMysql(u64, Vec<(String, String, bool)>),
+    MysqlDirectory(String),
+    ReviewMysql(String),
+    AdoptMysql(crate::engine::MysqlAdoptionConfirmation),
     ChooseDirectory(String, i32, isize, std::path::PathBuf),
     SaveConfig(String, String, String),
     Read(String, bool),
@@ -35,6 +38,11 @@ pub(super) enum Event {
         std::result::Result<Option<std::path::PathBuf>, String>,
     ),
     MysqlHints(u64, Vec<Option<(String, bool, bool)>>),
+    MysqlDirectory(
+        String,
+        std::result::Result<crate::mysql_data::Report, String>,
+    ),
+    MysqlReview(std::result::Result<crate::engine::MysqlAdoptionReview, String>),
     Saved(std::result::Result<String, String>),
     Snapshot(Box<Snapshot>, Option<String>, bool),
     Text(String, String, bool, Option<String>),
@@ -168,17 +176,14 @@ pub(super) fn worker(layout: Layout, rx: Receiver<Command>, tx: SyncSender<Event
                             keys.iter().filter(|key| *key == &keys[index]).count() == 1,
                             "数据目录名称重复，已被另一项服务使用"
                         );
-                        let exists = engine.inspect_mysql(&spec)?;
+                        let report = engine.mysql_directory_report(&spec)?;
+                        let exists = if report.can_adopt {
+                            true
+                        } else {
+                            engine.inspect_mysql(&spec)?
+                        };
                         Ok((
-                            format!(
-                                "{} · {}",
-                                path.display(),
-                                if exists {
-                                    "数据目录已存在，使用历史数据前需要确认"
-                                } else {
-                                    "首次启动时创建数据目录"
-                                }
-                            ),
+                            format!("{} · {}", path.display(), report.message),
                             exists,
                             true,
                         ))
@@ -190,6 +195,36 @@ pub(super) fn worker(layout: Layout, rx: Receiver<Command>, tx: SyncSender<Event
             continue;
         }
         let result = match command {
+            Command::MysqlDirectory(id) => {
+                let result = engine
+                    .config
+                    .mysql
+                    .iter()
+                    .find(|s| s.id == id)
+                    .context("请先保存 MySQL 服务")
+                    .and_then(|spec| engine.mysql_directory_report(spec));
+                send(Event::MysqlDirectory(
+                    id,
+                    result.map_err(|e| format!("{e:#}")),
+                ));
+                continue;
+            }
+            Command::ReviewMysql(id) => {
+                send(Event::MysqlReview(
+                    engine
+                        .review_mysql_adoption(&id)
+                        .map_err(|e| format!("{e:#}")),
+                ));
+                continue;
+            }
+            Command::AdoptMysql(confirmation) => engine.adopt_mysql(confirmation).map(|spec| {
+                send(Event::MysqlDirectory(
+                    spec.id.clone(),
+                    engine
+                        .mysql_directory_report(&spec)
+                        .map_err(|e| format!("{e:#}")),
+                ));
+            }),
             Command::Startup(settings) => {
                 let result = crate::startup::apply(&engine.layout, settings)
                     .map_err(|error| format!("{error:#}"));

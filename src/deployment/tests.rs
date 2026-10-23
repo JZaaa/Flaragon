@@ -43,11 +43,100 @@ fn package(ver: &str, mode: Mode) -> Package {
         mode,
         manifest,
         files,
+        repair_base: None,
     }
 }
 
 fn pass(_: &Path, _: &str) -> Result<()> {
     Ok(())
+}
+
+fn repair_package() -> Package {
+    let mut repair = package("0.2.0", Mode::Repair);
+    repair.repair_base = Some(repair.manifest.clone());
+    repair.manifest.release_id = "f".repeat(32);
+    repair.files.get_mut("Flaragon.exe").unwrap()[0] = b'R';
+    repair.files.insert(
+        RELEASE.into(),
+        serde_json::to_vec(&repair.manifest).unwrap(),
+    );
+    repair
+}
+
+#[test]
+fn same_version_repair_requires_exact_base_and_preserves_installation() {
+    let root = fixture();
+    first(&root);
+    let identity = installation(&root).unwrap();
+    let repair = repair_package();
+    let before = read_program(&root);
+    let lock = platform::AppLock::acquire(&root).unwrap();
+    assert!(run(&repair, &root, pass, None).is_err());
+    assert_eq!(read_program(&root), before);
+    drop(lock);
+    let mut other = repair_package();
+    other.repair_base.as_mut().unwrap().release_id = "a".repeat(32);
+    assert!(run(&other, &root, pass, None).is_err());
+    assert_eq!(read_program(&root), before);
+    run(&repair, &root, pass, None).unwrap();
+    assert_eq!(installed(&root).unwrap(), repair.manifest);
+    assert_eq!(installation(&root).unwrap(), identity);
+    assert!(run(&repair, &root, pass, None).is_err());
+    assert!(run(&package("0.2.0", Mode::Update), &root, pass, None).is_err());
+    run(&package("0.3.0", Mode::Update), &root, pass, None).unwrap();
+}
+
+#[test]
+fn interrupted_same_version_repair_requires_same_base_and_payload() {
+    let root = fixture();
+    first(&root);
+    let repair = repair_package();
+    assert!(run(&repair, &root, pass, Some(1)).is_err());
+    assert!(ensure_ready(&root).is_err());
+    let mut other = repair_package();
+    other.repair_base.as_mut().unwrap().release_id = "a".repeat(32);
+    assert!(run(&other, &root, pass, None).is_err());
+    let mut other = repair_package();
+    other.files.get_mut("Flaragon.exe").unwrap()[0] = b'X';
+    assert!(run(&other, &root, pass, None).is_err());
+    assert!(run(&repair, &root, fail, None).is_err());
+    run(&repair, &root, pass, None).unwrap();
+    assert!(ensure_ready(&root).is_ok());
+    assert_eq!(installed(&root).unwrap(), repair.manifest);
+}
+
+#[test]
+fn repair_archive_requires_baseline_and_does_not_enable_regular_same_version_update() {
+    let repair = repair_package();
+    let encode = |files: &BTreeMap<String, Vec<u8>>| {
+        let mut archive = tar::Builder::new(Vec::new());
+        for (name, data) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, name, data.as_slice())
+                .unwrap();
+        }
+        archive.into_inner().unwrap()
+    };
+    assert!(Package::from_archive(Mode::Repair, &encode(&repair.files)).is_err());
+    let mut files = repair.files.clone();
+    files.insert(
+        REPAIR_BASE.into(),
+        serde_json::to_vec(repair.repair_base.as_ref().unwrap()).unwrap(),
+    );
+    let parsed = Package::from_archive(Mode::Repair, &encode(&files)).unwrap();
+    assert_eq!(parsed.repair_base, repair.repair_base);
+    assert!(!parsed.files.contains_key(REPAIR_BASE));
+    assert!(Package::from_archive(Mode::Update, &encode(&files)).is_err());
+    let mut changed = repair.manifest.clone();
+    changed.version = "0.3.0".into();
+    assert!(repair_allowed(repair.repair_base.as_ref().unwrap(), &changed).is_err());
+    changed = repair.manifest.clone();
+    changed.files.insert("licenses/new.txt".into(), 10);
+    assert!(repair_allowed(repair.repair_base.as_ref().unwrap(), &changed).is_err());
 }
 fn fail(_: &Path, _: &str) -> Result<()> {
     bail!("self-check failed")

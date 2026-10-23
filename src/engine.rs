@@ -65,6 +65,24 @@ pub struct Engine {
     token: String,
     discovery_cache: discovery::Cache,
     addresses: Vec<String>,
+    mysql_adoption: Option<(MysqlAdoptionReview, crate::mysql_data::Stamp, Vec<u8>)>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct MysqlAdoptionReview {
+    pub token: String,
+    pub spec: MysqlSpec,
+    pub version: String,
+    pub description: String,
+}
+
+#[derive(Deserialize)]
+pub struct MysqlAdoptionConfirmation {
+    pub token: String,
+    pub source_version: String,
+    pub source_stopped: bool,
+    pub backup_confirmed: bool,
+    pub config_confirmed: bool,
 }
 impl Engine {
     pub fn running_ids(&self) -> Vec<String> {
@@ -75,30 +93,175 @@ impl Engine {
             .collect()
     }
     pub fn inspect_mysql(&self, spec: &MysqlSpec) -> Result<bool> {
+        use crate::mysql_data::State;
+        let report = self.mysql_directory_report(spec)?;
+        ensure!(
+            matches!(report.state, State::Missing | State::Empty | State::Bound),
+            "{}",
+            report.message
+        );
+        Ok(report.path.exists())
+    }
+    pub fn mysql_directory_report(&self, spec: &MysqlSpec) -> Result<crate::mysql_data::Report> {
         let package = self.package(&spec.package, Kind::Mysql)?;
         ensure!(
             mysql_series(&package.version)? == spec.series,
             "MySQL 组件与数据目录版本不匹配"
         );
-        let dir = spec.data_path(&self.layout)?;
-        let marker = spec.binding_path(&self.layout)?;
-        if marker.exists() {
-            let binding: String = serde_json::from_slice(&fs::read(marker)?)?;
+        crate::mysql_data::inspect(&self.layout, spec, package)
+    }
+    fn stopped_mysql_spec(&self, id: &str) -> Result<MysqlSpec> {
+        let spec = self
+            .config
+            .mysql
+            .iter()
+            .find(|s| s.id == id)
+            .context("请先保存 MySQL 服务")?
+            .clone();
+        ensure!(
+            !self.running_ids().contains(&format!("mysql:{id}")),
+            "MySQL 正在运行，请先正常停止"
+        );
+        ensure!(
+            spec.usage != ServiceUsage::Disabled,
+            "服务已停用，请先启用并保存设置"
+        );
+        Ok(spec)
+    }
+    pub fn review_mysql_adoption(&mut self, id: &str) -> Result<MysqlAdoptionReview> {
+        self.mysql_adoption = None;
+        let spec = self.stopped_mysql_spec(id)?;
+        let report = self.mysql_directory_report(&spec)?;
+        ensure!(report.can_adopt, "{}", report.message);
+        let package = self.package(&spec.package, Kind::Mysql)?;
+        ensure!(
+            package.version.starts_with("5.7.") || package.version.starts_with("8."),
+            "此 MySQL 构建尚不支持接入验证"
+        );
+        let version = package.version.clone();
+        let executable = self.layout.path(&package.executable)?;
+        let _guard = crate::mysql_data::exclusive_data_file(&self.layout, &spec)?;
+        let candidate = self.mysql_config(&spec)?;
+        let mut stamp = crate::mysql_data::stamp(&self.layout, &report.path)?;
+        stamp
+            .0
+            .extend(crate::mysql_data::stamp(&self.layout, &executable)?.0);
+        let review = MysqlAdoptionReview {
+            token: platform::random_token()?,
+            spec,
+            version: version.clone(),
+            description: format!(
+                "目录：{}\n所选版本：{}\n状态：{}\n版本线索：{}\n\n请核对实例配置与来源的表空间、大小写及插件设置。验证将启动 MySQL，再正常关闭；可能写入恢复日志和数据文件，不执行初始化、SQL 导入或升级。备份须由您提前完成。启动成功不代表已校验全部业务表。",
+                report.path.display(),
+                version,
+                report.message,
+                report
+                    .version_hint
+                    .as_deref()
+                    .unwrap_or("未找到可确认版本的记录，请填写已核实的完整来源版本")
+            ),
+        };
+        self.mysql_adoption = Some((review.clone(), stamp, fs::read(candidate)?));
+        Ok(review)
+    }
+    pub fn adopt_mysql(&mut self, confirmation: MysqlAdoptionConfirmation) -> Result<MysqlSpec> {
+        let (review, expected, config_bytes) =
+            self.mysql_adoption.take().context("请重新检查接入目录")?;
+        ensure!(
+            confirmation.token == review.token,
+            "接入确认已失效，请重新检查"
+        );
+        ensure!(
+            confirmation.source_stopped
+                && confirmation.backup_confirmed
+                && confirmation.config_confirmed,
+            "请确认来源正常停止、完整备份及配置匹配"
+        );
+        ensure!(
+            confirmation.source_version.trim() == review.version,
+            "来源完整版本必须与所选 MySQL 版本一致；接入不执行升级或降级"
+        );
+        let spec = self.stopped_mysql_spec(&review.spec.id)?;
+        ensure!(spec == review.spec, "服务设置已变化，请重新检查");
+        let report = self.mysql_directory_report(&spec)?;
+        ensure!(report.can_adopt, "{}", report.message);
+        let package = self.package(&spec.package, Kind::Mysql)?.clone();
+        ensure!(
+            package.version == review.version,
+            "组件版本已变化，请重新检查"
+        );
+        let (_directory, _) = platform::deployment::directory_guard(&report.path)?;
+        let exclusive = crate::mysql_data::exclusive_data_file(&self.layout, &spec)?;
+        let mut current = crate::mysql_data::stamp(&self.layout, &report.path)?;
+        current
+            .0
+            .extend(crate::mysql_data::stamp(&self.layout, &package.executable)?.0);
+        ensure!(
+            current == expected,
+            "检查后数据目录或组件发生变化，请重新检查"
+        );
+        let candidate = self.mysql_config(&spec)?;
+        ensure!(
+            fs::read(&candidate)? == config_bytes,
+            "检查后配置发生变化，请重新检查"
+        );
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, spec.port))
+            .context("MySQL 端口被占用，未访问占用服务")?;
+        drop(listener);
+        let conf = service_config::commit(&self.layout, &format!("mysql:{}", spec.id), &candidate)?;
+        let pending = self
+            .layout
+            .path(report.path.join(crate::mysql_data::ADOPTING))?;
+        atomic_write(
+            &pending,
+            &crate::mysql_data::binding_bytes(&package, "adopted")?,
+        )?;
+        drop(exclusive);
+        let id = format!("mysql:{}", spec.id);
+        let attempt = (|| -> Result<()> {
+            let mut args = vec![
+                format!("--defaults-file={}", conf.display()),
+                "--console".into(),
+                "--event-scheduler=OFF".into(),
+                "--skip-slave-start".into(),
+            ];
+            if package.version.starts_with("8.") {
+                args.push("--upgrade=NONE".into());
+            }
+            self.launch(
+                &id,
+                Kind::Mysql,
+                &package.executable,
+                &package.directory,
+                args,
+                vec![spec.port],
+                conf,
+            )?;
             ensure!(
-                binding == format!("{}:{}", spec.package, package.version),
-                "数据目录绑定其他 MySQL 构建，不能自动升级或降级"
+                crate::discovery::version(&protocol::mysql_greeting(spec.port)?) == package.version,
+                "接入验证返回的 MySQL 版本不符"
             );
+            self.stop_internal(&id)?;
             ensure!(
-                self.layout.path(dir.join("mysql"))?.is_dir(),
-                "历史数据目录不完整，拒绝重新初始化"
+                !spec.binding_path(&self.layout)?.exists(),
+                "验证期间出现其他绑定信息，拒绝覆盖"
             );
-        } else if dir.exists() {
-            ensure!(
-                dir.is_dir() && fs::read_dir(&dir)?.next().is_none(),
-                "数据目录已存在但无法确认版本，禁止使用或覆盖"
+            crate::mysql_data::publish_binding(&self.layout, &spec, &package, "adopted")?;
+            fs::remove_file(&pending)?;
+            Ok(())
+        })();
+        if let Err(error) = attempt {
+            let stopped = self
+                .stop_internal(&id)
+                .map(|_| "验证进程已停止".to_string())
+                .unwrap_or_else(|e| format!("正常停止未完成：{e:#}；请通过服务停止操作重试"));
+            bail!(
+                "接入未完成：{error:#}；{stopped}。数据保留，不重新初始化；请查看实例日志并重新检查。"
             );
         }
-        Ok(dir.exists())
+        self.message =
+            "已有 MySQL 数据接入成功，启动与正常关闭已验证；服务当前已停止，可正常启动".into();
+        Ok(spec)
     }
     fn validate_settings(&self, candidate: &Config) -> Result<()> {
         self.config
@@ -108,7 +271,12 @@ impl Engine {
             if old.is_none_or(|old| {
                 old.name != spec.name || old.series != spec.series || old.package != spec.package
             }) {
-                let exists = self.inspect_mysql(spec)?;
+                let report = self.mysql_directory_report(spec)?;
+                let exists = if report.can_adopt {
+                    true
+                } else {
+                    self.inspect_mysql(spec)?
+                };
                 ensure!(
                     !exists || spec.reuse_data,
                     "数据目录已存在，请确认使用历史数据：{}",
@@ -233,6 +401,7 @@ impl Engine {
             token: platform::random_token()?,
             discovery_cache: discovery::Cache::default(),
             addresses: platform::local_ipv4_addresses()?,
+            mysql_adoption: None,
         };
         engine.recover()?;
         Ok(engine)
@@ -1161,11 +1330,6 @@ impl Engine {
         let marker = spec.binding_path(&self.layout)?;
         self.inspect_mysql(&spec)?;
         if marker.exists() {
-            let binding: String = serde_json::from_slice(&fs::read(&marker)?)?;
-            ensure!(
-                binding == format!("{}:{}", spec.package, p.version),
-                "数据目录绑定其他 MySQL 构建，拒绝自动升级或降级"
-            );
             ensure!(dir.join("mysql").is_dir(), "数据目录不完整，拒绝重新初始化");
         } else {
             ensure!(
@@ -1173,6 +1337,13 @@ impl Engine {
                 "已有非空数据目录没有绑定信息，拒绝初始化"
             );
             fs::create_dir_all(&dir)?;
+            let initializing = self
+                .layout
+                .path(dir.join(crate::mysql_data::INITIALIZING))?;
+            atomic_write(
+                &initializing,
+                &crate::mysql_data::binding_bytes(&p, "initialized")?,
+            )?;
             let mut cmd = platform::command(&p.executable, &self.layout.root, &p.directory);
             cmd.arg(format!("--defaults-file={}", conf.display()))
                 .arg("--initialize-insecure");
@@ -1214,8 +1385,9 @@ impl Engine {
             );
             atomic_write(
                 &marker,
-                &serde_json::to_vec(&format!("{}:{}", spec.package, p.version))?,
+                &crate::mysql_data::binding_bytes(&p, "initialized")?,
             )?;
+            fs::remove_file(&initializing)?;
         }
         self.launch(
             &format!("mysql:{id}"),
@@ -1473,7 +1645,9 @@ impl Engine {
         let package = self.package(php, Kind::Php)?;
         ensure!(
             json["version"].as_str() == Some(&package.version),
-            "入口 PHP 版本不符：{host}:{port}"
+            "入口 PHP 版本不符：{host}:{port}（预期 {}，实际 {}）",
+            package.version,
+            json["version"].as_str().unwrap_or("缺少有效版本")
         );
         let expected = apache_path(root)?;
         ensure!(

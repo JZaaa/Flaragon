@@ -26,6 +26,26 @@ fn main() -> Result<()> {
             let id = value["id"].as_str().unwrap_or_default();
             match action {
                 "scan" => engine.scan()?,
+                "mysql_directory" => {
+                    let spec = engine
+                        .config
+                        .mysql
+                        .iter()
+                        .find(|s| s.id == id)
+                        .context("MySQL 服务不存在")?;
+                    return Ok(
+                        serde_json::json!({"ok":true,"report":engine.mysql_directory_report(spec)?,"snapshot":engine.snapshot()}),
+                    );
+                }
+                "mysql_adoption_review" => {
+                    let review = engine.review_mysql_adoption(id)?;
+                    return Ok(
+                        serde_json::json!({"ok":true,"review":review,"snapshot":engine.snapshot()}),
+                    );
+                }
+                "mysql_adopt" => {
+                    engine.adopt_mysql(serde_json::from_value(value["confirmation"].clone())?)?;
+                }
                 "snapshot" => (),
                 "start_all" => engine.start_all()?,
                 "start_common" => engine.start_common()?,

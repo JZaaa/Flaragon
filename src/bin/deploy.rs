@@ -96,6 +96,8 @@ fn run() -> Result<()> {
     ui.set_heading(
         if package.mode == Mode::Install {
             "安装 Flaragon"
+        } else if package.mode == Mode::Repair {
+            "修复 Flaragon"
         } else {
             "升级 Flaragon"
         }
@@ -104,6 +106,8 @@ fn run() -> Result<()> {
     ui.set_operation(
         if package.mode == Mode::Install {
             "开始安装"
+        } else if package.mode == Mode::Repair {
+            "开始修复"
         } else {
             "开始升级"
         }

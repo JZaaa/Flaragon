@@ -18,6 +18,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const MAGIC: &[u8; 16] = b"FLARAGONPACK0001";
 const LIMIT: u64 = 512 * 1024 * 1024;
 const RELEASE: &str = "release.json";
+const REPAIR_BASE: &str = "repair-base.json";
 const INSTALLATION: &str = ".flaragon-install.json";
 const ACTIVE: &str = ".maintenance/active.json";
 const OWNER: &str = ".maintenance/owner.json";
@@ -27,6 +28,7 @@ const OWNER_BYTES: &[u8] = b"{\"product\":\"Flaragon\",\"format\":1}";
 pub enum Mode {
     Install,
     Update,
+    Repair,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -50,6 +52,7 @@ pub struct Package {
     pub mode: Mode,
     pub manifest: Manifest,
     files: BTreeMap<String, Vec<u8>>,
+    repair_base: Option<Manifest>,
 }
 
 fn version(value: &str) -> Result<[u16; 3]> {
@@ -167,6 +170,7 @@ impl Package {
         let mode = match trailer[8] {
             0 => Mode::Install,
             1 => Mode::Update,
+            2 => Mode::Repair,
             _ => bail!("载荷模式无效"),
         };
         file.seek(SeekFrom::Start(size - 25 - length))?;
@@ -195,11 +199,11 @@ impl Package {
                 .to_str()
                 .context("安装包路径编码无效")?
                 .to_owned();
-            if name != RELEASE {
+            if name != RELEASE && !(mode == Mode::Repair && name == REPAIR_BASE) {
                 program_file(&name)?;
             }
             ensure!(
-                seen.insert(name.to_lowercase()) && seen.len() <= 8193,
+                seen.insert(name.to_lowercase()) && seen.len() <= 8194,
                 "安装包存在重复路径或文件过多"
             );
             ensure!(entry.size() <= LIMIT, "安装文件过大");
@@ -210,6 +214,18 @@ impl Package {
         let manifest: Manifest =
             serde_json::from_slice(files.get(RELEASE).context("安装包缺少发布清单")?)?;
         manifest.validate()?;
+        let repair_base = if mode == Mode::Repair {
+            let base: Manifest = serde_json::from_slice(
+                &files
+                    .remove(REPAIR_BASE)
+                    .context("修复包缺少适用安装清单")?,
+            )?;
+            base.validate()?;
+            repair_allowed(&base, &manifest)?;
+            Some(base)
+        } else {
+            None
+        };
         ensure!(
             files.len() == manifest.files.len() + 1,
             "安装包与发布清单不一致"
@@ -224,6 +240,7 @@ impl Package {
             mode,
             manifest,
             files,
+            repair_base,
         })
     }
 }
@@ -489,10 +506,14 @@ impl Journal {
         self.next.validate()?;
         if let Some(old) = &self.previous {
             old.validate()?;
-            upgrade_allowed(old, &self.next)?;
+            if self.mode == Mode::Repair {
+                repair_allowed(old, &self.next)?;
+            } else {
+                upgrade_allowed(old, &self.next)?;
+            }
         }
         ensure!(
-            (self.mode == Mode::Update) == self.previous.is_some(),
+            (self.mode != Mode::Install) == self.previous.is_some(),
             "更新记录模式无效"
         );
         Ok(())
@@ -521,6 +542,12 @@ fn pending(root: &Path, package: &Package) -> Result<Option<Journal>> {
     );
     let journal: Journal = serde_json::from_slice(&read_limited(&path, 8 * 1024 * 1024)?)?;
     journal.validate()?;
+    if package.mode == Mode::Repair {
+        ensure!(
+            package.repair_base.is_some() && journal.previous == package.repair_base,
+            "未完成修复与此包的适用安装不符"
+        );
+    }
     ensure!(
         journal.next == package.manifest && journal.mode == package.mode,
         "目录存在未完成更新，请使用原目标版本 {} 的同一发布包修复；不支持回退",
@@ -575,6 +602,27 @@ fn upgrade_allowed(old: &Manifest, next: &Manifest) -> Result<()> {
     );
     Ok(())
 }
+fn repair_allowed(old: &Manifest, next: &Manifest) -> Result<()> {
+    ensure!(
+        old.version == next.version && old.release_id != next.release_id,
+        "修复包仅适用于指定版本的未修复安装"
+    );
+    ensure!(
+        old.product == next.product
+            && old.architecture == next.architecture
+            && old.format == next.format
+            && old.config_schema == next.config_schema
+            && old.minimum_version == next.minimum_version
+            && old.excluded_versions == next.excluded_versions
+            && next.remove.is_empty()
+            && old.files.keys().eq(next.files.keys())
+            && old.files.iter().all(|(name, size)| {
+                name == "Flaragon.exe" || next.files.get(name) == Some(size)
+            }),
+        "修复包必须保持产品版本、配置格式和程序文件集合"
+    );
+    Ok(())
+}
 fn installed_files(
     root: &Path,
     manifest: &Manifest,
@@ -614,6 +662,8 @@ impl Review {
             package.manifest.version,
             if self.pending.is_some() {
                 "此目录存在未完成操作，将继续修复目标版本。"
+            } else if package.mode == Mode::Repair {
+                "已确认此安装适用修复包；修复后产品版本号保持不变。"
             } else if package.mode == Mode::Update {
                 "已确认 Flaragon 安装身份与程序文件。"
             } else {
@@ -648,14 +698,23 @@ fn inspect_with(
             install_directory_empty(&root)?;
             (None, None)
         }
-        Mode::Update => {
+        Mode::Update | Mode::Repair => {
             let identity = installation(&root)?;
             let old = installed(&root)?;
             installed_files(&root, &old, identify)?;
             // Occupied files are rejected even when the selected package happens to be the same version.
             platform::deployment::ensure_files_free(&root, old.files.keys().cloned())?;
             stopped(&root)?;
-            upgrade_allowed(&old, &package.manifest)?;
+            if package.mode == Mode::Repair {
+                ensure!(old != package.manifest, "此安装已应用该修复，无需重复更新");
+                ensure!(
+                    package.repair_base.as_ref() == Some(&old),
+                    "此安装不属于修复包指定的原始版本或构建"
+                );
+                repair_allowed(&old, &package.manifest)?;
+            } else {
+                upgrade_allowed(&old, &package.manifest)?;
+            }
             for name in package.manifest.files.keys() {
                 ensure!(
                     !checked(&root, name)?.exists() || old.files.contains_key(name),
@@ -830,6 +889,8 @@ fn deploy_with(
         "{}完成：Flaragon {}\n{}{}",
         if package.mode == Mode::Install {
             "安装"
+        } else if package.mode == Mode::Repair {
+            "修复"
         } else {
             "升级"
         },

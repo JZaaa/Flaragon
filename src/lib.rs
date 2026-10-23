@@ -4,6 +4,7 @@ pub mod deployment;
 pub mod discovery;
 pub mod engine;
 pub mod hosts;
+pub mod mysql_data;
 pub mod platform;
 pub mod protocol;
 pub mod relocation;

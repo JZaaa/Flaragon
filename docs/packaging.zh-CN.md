@@ -1,6 +1,6 @@
 # 打包操作
 
-本文说明从源码生成发布 EXE 的操作。每次发版及版本号由用户指定，当前发布版本为 **0.0.1**。
+本文说明从源码生成发布 EXE 的操作。每次发版及版本号由用户指定，当前发布版本为 **0.0.2**。
 
 ## 准备条件
 
@@ -29,30 +29,30 @@
 
 `-SkipBuild` 仍执行许可收集、自检和组包，不能用来跳过失败的检查或发布旧构建。
 
-初始版本生成后，可执行真实 EXE 安装验收：
+生成后，执行真实 EXE 安装与升级验收：
 
 ```powershell
 . .\scripts\env.ps1
-& .\.tools\python\python.exe .\scripts\acceptance-initial-release.py
+& .\.tools\python\python.exe .\scripts\acceptance-release.py --baseline 0.0.1 --repair .\dist\repairs\php-version-0.0.1\update.exe
 ```
 
-该脚本仅在项目的 `testwork` 中新建独立安装目录，检查载荷、版本自检、多环境隔离及错误目标拒绝，不启动组件服务。结果保存在 `testwork/evidence/initial-release-<版本>.json`，不替代 GUI、真实组件或跨机器验证。
+该脚本仅在项目的 `testwork` 中新建独立安装目录，检查安装载荷、版本自检、原始及已修复安装升级、用户文件与修改时间保留、运行占用拒绝、多环境隔离及中断续修，不启动组件服务。结果保存在 `testwork/evidence/release-<版本>.json`，不替代 GUI、真实组件或跨机器验证。`--baseline` 指定已归档的低版本安装包；`--repair` 为可选的对应基线修复包。
 
 ## 输出与命名
 
-输出目录为项目内的 `dist/<版本>/`。0.0.1 的文件如下：
+输出目录为项目内的 `dist/<版本>/`。0.0.2 的文件如下：
 
 | 文件 | 用途 |
 | --- | --- |
-| `dist/0.0.1/Flaragon-Setup-0.0.1-x64.exe` | 初始版本安装包 |
-| `dist/0.0.1/Flaragon-Update-0.0.1-x64.exe` | 同版本软件载荷的升级入口 |
-| `dist/0.0.1/payload/` | 组包载荷，含 Flaragon.exe、编辑器 DLL、许可和发布清单 |
-| `dist/0.0.1/release.json` | 发布版本、架构、兼容范围及文件清单 |
-| `dist/0.0.1/build-info.json` | 构建来源、包内容和签名状态说明 |
+| `dist/0.0.2/Flaragon-Setup-0.0.2-x64.exe` | 新环境安装包 |
+| `dist/0.0.2/Flaragon-Update-0.0.2-x64.exe` | 已有正式安装的升级包 |
+| `dist/0.0.2/payload/` | 组包载荷，含 Flaragon.exe、编辑器 DLL、许可和发布清单 |
+| `dist/0.0.2/release.json` | 发布版本、架构、兼容范围及文件清单 |
+| `dist/0.0.2/build-info.json` | 构建来源、包内容和签名状态说明 |
 
 通用命名为 `Flaragon-Setup-<版本>-x64.exe` 和 `Flaragon-Update-<版本>-x64.exe`。对外提供安装 EXE 即可，不需要附带源码、Rust 或打包脚本。
 
-0.0.1 为初始版本，使用 Setup 包；当前没有可升级至 0.0.1 的更早正式版本。Update 包不用于首次安装，也不能将更高版本降级到 0.0.1。最低兼容版本设为 0.0.1，不据此宣称已验证跨版本升级。
+新环境使用 Setup 包；已有 0.0.1 正式安装使用 Update 包，已安装 PHP 专用修复包的 0.0.1 也在兼容范围内。最低兼容版本为 0.0.1。升级前在目标环境“停止并退出”，再运行 Update，选择安装目录，点击“检查目录 → 开始升级”。同版本、降级和无安装清单目录拒绝；实际验收范围以 README 为准。
 
 ## 产物范围与检查
 
@@ -62,5 +62,19 @@
 - 构建文件位于 `target/x86_64-pc-windows-msvc/release/`。打包不覆盖项目根目录正在使用的 `Flaragon.exe`。
 - `dist`、`target`、DLL、组件和缓存均由 `.gitignore` 排除，不加入 Git。
 - 当前发布包未签名；Windows 10、跨电脑及不同 DPI 的完整验证范围见 [README](../README.md)。
+
+## 不发版的专用修复包
+
+仅在用户明确要求后生成同版本修复包。已归档的 PHP 完整版本修复包仅适用于原始 0.0.1 正式安装，修复后仍为 0.0.1；重复修复、其他构建和未知目录均拒绝。当前 0.0.2 源码不能用下列专用脚本重新生成 0.0.1 修复包；脚本要求匹配的 0.0.1 源码与构建。
+
+```powershell
+.\scripts\package-repair.ps1
+```
+
+匹配源码已完成全部检查和 Release 构建时，可加 `-SkipBuild`。输出为 `dist/repairs/php-version-0.0.1/update.exe`，同目录保存载荷、构建清单与来源。脚本使用已归档 0.0.1 的编辑器 DLL 和许可，只替换载荷主程序；已有修复包和正式发布归档不覆盖。此修复包不包含 MySQL 数据接入功能。
+
+使用时先在目标软件中“停止并退出”，运行 `update.exe`，选择原始安装目录，点击“检查目录”和“开始修复”。目标目录内的组件、配置、项目、数据库和会话文件保留。修复中断后重新运行同一文件完成续修。
+
+真实 EXE 验收命令：加载 `scripts/env.ps1` 后，运行 `.\.tools\python\python.exe .\scripts\acceptance-repair.py`；只操作项目内的新建安装夹具。
 
 安装和升级的产品操作见[安装与升级方案](deployment.zh-CN.md)，本次功能概述见 [CHANGELOG.md](../CHANGELOG.md)。
