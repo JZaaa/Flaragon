@@ -1,9 +1,11 @@
 """Build the two offline deployment EXEs from a strict, project-local payload allowlist."""
 from pathlib import Path
+import argparse
 import gzip
 import io
 import json
 import os
+import re
 import struct
 import subprocess
 import tarfile
@@ -62,10 +64,20 @@ def write_package(stub, payload, destination, mode):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--build-id', help='Explicitly requested same-version rebuild in a separate archive')
+    args = parser.parse_args()
     if os.environ.get('FLARAGON_DEV_ROOT', '').lower() != str(ROOT).lower():
         raise ValueError('Run scripts/env.ps1 first')
     version = tomllib.loads(checked(ROOT / 'Cargo.toml').read_text(encoding='utf-8'))['package']['version']
-    output = checked(ROOT / 'dist' / version)
+    if args.build_id:
+        if not re.fullmatch(r'[a-z][a-z0-9.-]{0,79}', args.build_id) or not args.build_id.endswith('-' + version):
+            raise ValueError('Build identifier must be a safe name ending with the product version')
+        output = checked(ROOT / 'dist/rebuilds' / args.build_id)
+        if output.exists():
+            raise ValueError('Rebuild archive already exists; choose a new build identifier')
+    else:
+        output = checked(ROOT / 'dist' / version)
     output.mkdir(parents=True, exist_ok=True)
     manifest_path = checked(output / 'release.json')
     previous = json.loads(manifest_path.read_text(encoding='utf-8')) if manifest_path.exists() else None
@@ -95,6 +107,8 @@ def main():
         'version': version, 'target': manifest['architecture'], 'source': 'Cargo.lock and project release build',
         'components_included': False, 'file_count': len(files), 'signed': False,
         'executable_bytes': len(files['Flaragon.exe']),
+        'build_id': args.build_id,
+        'release_id': release_id,
     }, indent=2) + '\n', encoding='utf-8')
 
 

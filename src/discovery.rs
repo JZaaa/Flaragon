@@ -108,7 +108,12 @@ pub fn scan_cached(layout: &Layout, cache: &mut Cache) -> Result<Vec<Package>> {
                 }
                 match kind {
                     Kind::Php => {
-                        cmd.args(["-n", "-r", "echo PHP_VERSION,'|',PHP_INT_SIZE,'|',PHP_ZTS;"]);
+                        // PHP_ZTS is bool since PHP 8.4; casting keeps NTS false encoded as 0.
+                        cmd.args([
+                            "-n",
+                            "-r",
+                            "echo PHP_VERSION,'|',PHP_INT_SIZE,'|',(int)PHP_ZTS;",
+                        ]);
                     }
                     Kind::Apache => {
                         cmd.arg("-v");
@@ -267,6 +272,8 @@ mod tests {
         for (reported, thread_safe) in [
             ("7.4.33", false),
             ("7.9.99-p261023", true),
+            ("8.3.35", false),
+            ("8.5.11", false),
             ("8.5.0RC1", false),
             ("8.6.0-dev+custom.1", true),
         ] {
@@ -282,6 +289,7 @@ mod tests {
             "|8|1",
             "7.9.99-p261023|4|1",
             "7.9.99-p261023|8|2",
+            "8.5.11|8|",
             "7.9.99-p261023|8|1|extra",
             "Warning: startup failed\n7.9.99-p261023|8|1",
             "7.9.99\0-p261023|8|1",

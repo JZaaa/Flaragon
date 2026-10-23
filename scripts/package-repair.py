@@ -20,6 +20,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--repair-id', required=True)
     parser.add_argument('--description', required=True)
+    parser.add_argument('--base-repair-id', help='Bind to the resulting build of an archived repair')
     args = parser.parse_args()
     assert os.environ.get('FLARAGON_DEV_ROOT', '').lower() == str(ROOT).lower()
     version = tomllib.loads(checked(ROOT / 'Cargo.toml').read_text(encoding='utf-8'))['package']['version']
@@ -27,9 +28,18 @@ def main():
     assert args.repair_id.endswith('-' + version), 'Repair identifier must end with the product version'
     assert args.description.strip(), 'A repair description is required'
     release = checked(ROOT / 'dist' / version)
+    if args.base_repair_id:
+        assert re.fullmatch(r'[a-z][a-z0-9.-]{0,79}', args.base_repair_id), 'Invalid baseline repair identifier'
+        assert args.base_repair_id.endswith('-' + version), 'Baseline repair version mismatch'
+        assert args.base_repair_id != args.repair_id, 'Repair cannot replace its own baseline archive'
+        release = checked(ROOT / 'dist/repairs' / args.base_repair_id)
+        info = json.loads(checked(release / 'build-info.json').read_bytes())
+        assert info['repair_id'] == args.base_repair_id and info['product_version'] == version
     base_bytes = checked(release / 'release.json').read_bytes()
     base = json.loads(base_bytes)
     assert base['version'] == version and base['product'] == 'Flaragon', 'Baseline product/version mismatch'
+    if args.base_repair_id:
+        assert info['repair_build_id'] == base['release_id'], 'Baseline repair identity mismatch'
     files = {name: checked(release / 'payload' / name).read_bytes() for name in base['files']}
     assert all(len(files[name]) == size for name, size in base['files'].items())
     main_exe = checked(ROOT / 'target/x86_64-pc-windows-msvc/release/Flaragon.exe').read_bytes()
@@ -63,7 +73,8 @@ def main():
     checked(output / 'build-info.json').write_text(json.dumps(dict(
         purpose=args.description, product_version=version, repair_id=args.repair_id,
         base_release_id=base['release_id'], repair_build_id=manifest['release_id'],
-        source=f'Cargo.lock and project release build; original {version} editor DLLs and licenses',
+        base_repair_id=args.base_repair_id,
+        source=f'Cargo.lock and project release build; editor DLLs and licenses from {release.relative_to(ROOT).as_posix()}',
         official_release=False, signed=False), indent=2), encoding='utf-8')
     print(output / 'update.exe')
 

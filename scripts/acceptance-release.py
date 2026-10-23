@@ -19,11 +19,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--baseline', required=True)
     parser.add_argument('--repair', type=Path)
+    parser.add_argument('--release', type=Path, help='Separate rebuild archive to validate')
     args = parser.parse_args()
     assert os.environ.get('FLARAGON_DEV_ROOT', '').lower() == str(ROOT).lower()
     current = tomllib.loads(checked(ROOT / 'Cargo.toml').read_text(encoding='utf-8'))['package']['version']
     assert tuple(map(int, args.baseline.split('.'))) < tuple(map(int, current.split('.')))
-    release = checked(ROOT / 'dist' / current)
+    release = checked(args.release.absolute()) if args.release else checked(ROOT / 'dist' / current)
     manifest = json.loads(checked(release / 'release.json').read_bytes())
     assert manifest['version'] == current
     assert manifest['architecture'] == 'x86_64-pc-windows-msvc'
@@ -135,10 +136,12 @@ def main():
     verify(resume)
     assert not checked(resume / '.maintenance/active.json').exists()
     record('same release completes interrupted upgrade with main executable already replaced')
-    evidence = dict(version=current, baseline=args.baseline, fixture_root=str(base), checks=results,
+    evidence = dict(version=current, release=str(release), release_id=manifest['release_id'],
+        baseline=args.baseline, fixture_root=str(base), checks=results,
         stopped=True, limits=['User files are independent sentinels; no database compatibility claim',
                               'Cross-machine, DPI and actual power-loss faults not tested'])
-    write(ROOT, f'testwork/evidence/release-{current}.json', json.dumps(evidence, ensure_ascii=False, indent=2).encode())
+    evidence_name = release.name if args.release else current
+    write(ROOT, f'testwork/evidence/release-{evidence_name}.json', json.dumps(evidence, ensure_ascii=False, indent=2).encode())
     print(json.dumps(evidence, ensure_ascii=False, indent=2))
 
 

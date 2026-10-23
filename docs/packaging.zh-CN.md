@@ -1,6 +1,6 @@
 # 打包操作
 
-本文说明从源码生成发布 EXE 的操作。每次发版及版本号由用户指定，当前发布版本为 **0.0.2**。
+本文说明从源码生成发布 EXE 的操作。每次发版及版本号由用户指定。
 
 ## 准备条件
 
@@ -40,7 +40,7 @@
 
 ## 输出与命名
 
-输出目录为项目内的 `dist/<版本>/`。0.0.2 的文件如下：
+输出目录为项目内的 `dist/<版本>/`。如 0.0.2 的文件如下：
 
 | 文件 | 用途 |
 | --- | --- |
@@ -58,30 +58,59 @@
 
 - 包仅包含管理器、Scintilla/Lexilla、第三方许可和发布清单，不包含 Apache、PHP、MySQL、Redis、本地配置、数据库或网站。
 - `Cargo.toml`、EXE 产品版本、安装界面、包名和 `release.json` 必须一致。不能只重命名 EXE 来修改版本。
-- 同一发布版本的载荷固定，内容变化时脚本拒绝覆盖；需要由用户指定新版本，不能删除既有发布目录绕过检查。
+- 每份发布归档的载荷固定，内容变化时脚本拒绝覆盖；通常由用户指定新版本。用户明确要求同版本重打包时，使用独立构建标识另存，不能删除既有发布目录绕过检查。
 - 构建文件位于 `target/x86_64-pc-windows-msvc/release/`。打包不覆盖项目根目录正在使用的 `Flaragon.exe`。
 - `dist`、`target`、DLL、组件和缓存均由 `.gitignore` 排除，不加入 Git。
 - 当前发布包未签名；Windows 10、跨电脑及不同 DPI 的待验证范围见 [PLAN](../PLAN.md)。
 
 ## 不发版的专用修复包
 
-仅在用户明确要求后生成同版本修复包。脚本从 `Cargo.toml` 读取产品版本，绑定 `dist/<版本>/release.json` 中的原始安装清单与构建身份。修复标识必须以产品版本结尾，用于独立归档；重复修复、其他构建和未知目录均拒绝。
+仅在用户明确要求后生成同版本修复包。脚本从 `Cargo.toml` 读取产品版本，默认绑定 `dist/<版本>/release.json` 中的原始安装清单与构建身份。已应用归档修复包的安装，通过 `-BaseRepairId` 指定该修复包标识，绑定其修复结果的清单与构建身份。修复标识必须以产品版本结尾，用于独立归档；重复修复、其他构建和未知目录均拒绝。
 
 ```powershell
 .\scripts\package-repair.ps1 -RepairId redis-refresh-0.0.2 -Description 'Redis authentication and component settings refresh'
 ```
 
-匹配源码已完成全部检查和 Release 构建时，可加 `-SkipBuild`。输出为 `dist/repairs/<修复标识>/update.exe`，同目录保存载荷、构建清单与来源。脚本使用对应正式版本已归档的编辑器 DLL 和许可，只替换载荷主程序；已有修复包和正式发布归档不覆盖。
+匹配源码已完成全部检查和 Release 构建时，可加 `-SkipBuild`。输出为 `dist/repairs/<修复标识>/update.exe`，同目录保存载荷、构建清单与来源。脚本使用所选基线归档的编辑器 DLL 和许可，只替换载荷主程序；已有修复包和正式发布归档不覆盖。
 
 | 修复包 | 适用安装 | 内容 |
 | --- | --- | --- |
+| `dist/repairs/latest-dev-from-redis-refresh-0.0.2/update.exe` | 已应用 `redis-refresh-0.0.2` 的 0.0.2 安装 | 更新至当前开发程序，包含 PHP 8.4 以上 NTS 识别修正 |
+| `dist/repairs/latest-dev-0.0.2/update.exe` | 原始 0.0.2 正式安装 | 当前开发功能及 PHP 8.4 以上 NTS 识别修正；保留 Redis 认证与组件刷新功能 |
 | `dist/repairs/redis-refresh-0.0.2/update.exe` | 原始 0.0.2 正式安装 | Redis 密码配置与认证启停、环境设置组件刷新 |
 | `dist/repairs/php-version-0.0.1/update.exe` | 原始 0.0.1 正式安装 | PHP 完整版本识别，不包含 MySQL 数据接入 |
 
 当前源码不能重新生成旧版本修复包；重新生成必须使用与其产品版本和载荷一致的源码及构建。
 
-使用时先在目标软件中“停止并退出”，运行 `update.exe`，选择原始安装目录，点击“检查目录”和“开始修复”。目标目录内的组件、配置、项目、数据库和会话文件保留。修复中断后重新运行同一文件完成续修。
+使用时先在目标软件中“停止并退出”，运行与当前构建匹配的 `update.exe`，选择安装目录，点击“检查目录”和“开始修复”。目标目录内的组件、配置、项目、数据库和会话文件保留。修复中断后重新运行同一文件完成续修。
+
+针对已应用 `redis-refresh-0.0.2` 的安装生成及验证后续补丁：
+
+```powershell
+.\scripts\package-repair.ps1 -RepairId latest-dev-from-redis-refresh-0.0.2 -BaseRepairId redis-refresh-0.0.2 -Description 'Update the redis-refresh repaired build to the latest development program' -SkipBuild
+. .\scripts\env.ps1
+& .\.tools\python\python.exe .\scripts\acceptance-repair.py --repair .\dist\repairs\latest-dev-from-redis-refresh-0.0.2 --baseline-repair .\dist\repairs\redis-refresh-0.0.2
+```
+
+验收在项目内新安装原始版本、应用指定的前置补丁，再验证后续修复及中断续修。后续补丁仅接受该前置构建；不要通过删除或改写安装清单绕过身份检查，也不需要重新安装环境。
 
 真实 EXE 验收命令：加载 `scripts/env.ps1` 后，运行 `.\.tools\python\python.exe .\scripts\acceptance-repair.py --repair .\dist\repairs\redis-refresh-0.0.2`；只操作项目内的新建安装夹具。其他修复包通过 `--repair` 指定对应目录。
+
+## 用户指定的同版本重打包
+
+只有用户明确指定同版本重打包时才使用 `-BuildId`，标识须以产品版本结尾。以下命令示例对应独立归档；该目录已存在时不能重复生成或覆盖，应使用新的唯一构建标识。
+
+```powershell
+.\scripts\package.ps1 -BuildId latest-dev-0.0.2
+```
+
+输出目录为 `dist/rebuilds/<构建标识>/`，包含同版本 Setup、Update、载荷与清单，使用新的 `release_id`。原始 `dist/<版本>/` 及已有修复包保持不变。新安装使用此目录中的 Setup；已有较低版本使用 Update；已有相同版本仍须使用与当前构建匹配的专属补丁，普通 Update 不开放同版本更新。`latest-dev-0.0.2` 补丁针对原始 0.0.2；已应用 `redis-refresh-0.0.2` 的安装使用 `latest-dev-from-redis-refresh-0.0.2`。
+
+匹配源码已完成全部检查与 Release 构建时可以加 `-SkipBuild`。验收通过 `--release` 指定独立归档，证据按构建标识分别保存：
+
+```powershell
+. .\scripts\env.ps1
+& .\.tools\python\python.exe .\scripts\acceptance-release.py --baseline 0.0.1 --repair .\dist\repairs\php-version-0.0.1\update.exe --release .\dist\rebuilds\latest-dev-0.0.2
+```
 
 安装和升级的产品操作见[安装与升级方案](deployment.zh-CN.md)，当前开发内容与已发布版本功能概述见 [CHANGELOG.md](../CHANGELOG.md)。

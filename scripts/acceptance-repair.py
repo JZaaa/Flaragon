@@ -17,6 +17,7 @@ checked = builder.checked
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--repair', type=Path, required=True)
+    parser.add_argument('--baseline-repair', type=Path, help='Apply this archived repair before testing the next repair')
     args = parser.parse_args()
     assert os.environ.get('FLARAGON_DEV_ROOT', '').lower() == str(ROOT).lower()
     repair = checked(args.repair.absolute())
@@ -25,6 +26,9 @@ def main():
     version = manifest['version']
     release = checked(ROOT / 'dist' / version)
     setup = checked(release / f'Flaragon-Setup-{version}-x64.exe')
+    baseline_repair = checked(args.baseline_repair.absolute()) if args.baseline_repair else None
+    if baseline_repair:
+        release = baseline_repair
     original_manifest = json.loads(checked(release / 'release.json').read_bytes())
     assert json.loads(checked(repair / 'payload/repair-base.json').read_bytes()) == original_manifest
     base = checked(ROOT / 'testwork' / ('repair-' + uuid.uuid4().hex[:12]))
@@ -51,6 +55,14 @@ def main():
     first, second, gui = [checked(base / name) for name in ['修复 中文 空格', 'independent', 'gui-target']]
     for target in [first, second, gui]:
         call(setup, '--apply', target)
+        if baseline_repair:
+            before = program(target)
+            call(update, '--apply', target, False)
+            assert program(target) == before
+            call(checked(baseline_repair / 'update.exe'), '--apply', target)
+            assert json.loads(checked(target / 'release.json').read_bytes()) == original_manifest
+    if baseline_repair:
+        results.append('Original installation is rejected unchanged; archived prior repair establishes the required baseline')
     second_before = program(second)
     call(original_update, '--inspect', first, False)
     call(update, '--inspect', base / 'not-installed', False)
@@ -114,6 +126,8 @@ def main():
     assert not checked(second / '.maintenance/active.json').exists()
     results.append('Real repair EXE completes an interrupted transaction with a replaced main executable')
     evidence = dict(product_version=manifest['version'], official_release=False, repair=str(update),
+        baseline_repair=str(baseline_repair) if baseline_repair else None,
+        base_release_id=original_manifest['release_id'], repair_build_id=manifest['release_id'],
         gui_target=str(gui), fixture_root=str(base), results=results, stopped=True)
     path = checked(ROOT / 'testwork/evidence' / ('repair-' + repair.name + '.json'))
     path.write_text(json.dumps(evidence, ensure_ascii=False, indent=2), encoding='utf-8')

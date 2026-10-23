@@ -12,7 +12,12 @@ spec = importlib.util.spec_from_file_location(
 web = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(web)
 CUSTOM = 'php-7.9.99-p261023-Win32-vc15-x64-TS'
-VERSIONS = {CUSTOM: '7.9.99-p261023', 'php-7.4.33': '7.4.33'}
+VERSIONS = {
+    CUSTOM: '7.9.99-p261023',
+    'php-7.4.33': '7.4.33',
+    'php-8.3.35': '8.3.35',
+    'php-8.5.11': '8.5.11',
+}
 
 
 def copy_package(component, name):
@@ -50,11 +55,18 @@ def main():
         session.call('scan')
         packages = {p['id']: p for p in session.snapshot['packages']}
         assert all(p['error'] is None for p in packages.values()), packages
+        php_packages = {p['id'] for p in packages.values() if p['kind'] == 'php'}
+        assert len(php_packages) == len(VERSIONS), packages
+        settings = session.snapshot['config']['php']
+        assert {p['package'] for p in settings} == php_packages, settings
+        assert len(settings) == len(php_packages), settings
         for package in packages.values():
             if package['kind'] == 'php':
                 assert package['version'] == VERSIONS[package['name']], package
                 assert package['php_thread_safe'] == (package['name'] == CUSTOM), package
-        results.append('Complete custom TS and standard NTS versions discovered')
+        session.call('scan')
+        assert session.snapshot['config']['php'] == settings
+        results.append('Custom TS and PHP 7.4/8.3/8.5 NTS packages are discovered and appear once in settings after repeated scans')
         config = copy.deepcopy(session.snapshot['config'])
         ports = iter(free_ports(1 + 2 * len(config['php'])))
         config.update(http_port=next(ports), http_address='127.0.0.1')
