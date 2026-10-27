@@ -51,6 +51,49 @@ fn pass(_: &Path, _: &str) -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn previous_release_only_rejects_skips_without_changes_and_resumes() {
+    let make = |ver: &str, minimum: &str, mode| {
+        let mut p = package(ver, mode);
+        p.manifest.minimum_version = minimum.into();
+        p.files
+            .insert(RELEASE.into(), serde_json::to_vec(&p.manifest).unwrap());
+        p
+    };
+    let root = fixture();
+    let old = make("0.0.2", "0.0.1", Mode::Install);
+    run(&old, &root, pass, None).unwrap();
+    let next = make("0.0.4", "0.0.3", Mode::Update);
+    let before = read_program(&root);
+    let error = run(&next, &root, pass, None).unwrap_err().to_string();
+    assert!(error.contains("上一正式版本 0.0.3"));
+    assert_eq!(before, read_program(&root));
+    assert!(!root.join(ACTIVE).exists());
+
+    let previous = make("0.0.3", "0.0.1", Mode::Update);
+    run(&previous, &root, pass, None).unwrap();
+    assert!(run(&next, &root, pass, Some(1)).is_err());
+    run(&next, &root, pass, None).unwrap();
+    assert_eq!(installed(&root).unwrap(), next.manifest);
+    assert!(run(&next, &root, pass, None).is_err());
+    assert!(run(&previous, &root, pass, None).is_err());
+}
+
+#[test]
+fn previous_release_is_exact_across_version_gaps_and_legacy_range_is_preserved() {
+    let mut next = package("0.1.0", Mode::Update).manifest;
+    next.minimum_version = "0.0.4".into();
+    assert!(upgrade_allowed(&package("0.0.4", Mode::Install).manifest, &next).is_ok());
+    for ver in ["0.0.3", "0.0.5", "0.1.0", "0.2.0"] {
+        assert!(upgrade_allowed(&package(ver, Mode::Install).manifest, &next).is_err());
+    }
+    next.version = "0.0.3".into();
+    next.minimum_version = "0.0.1".into();
+    for ver in ["0.0.1", "0.0.2"] {
+        assert!(upgrade_allowed(&package(ver, Mode::Install).manifest, &next).is_ok());
+    }
+}
+
 fn repair_package() -> Package {
     let mut repair = package("0.2.0", Mode::Repair);
     repair.repair_base = Some(repair.manifest.clone());

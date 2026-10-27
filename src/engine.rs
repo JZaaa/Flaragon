@@ -1,7 +1,7 @@
 use crate::{
     Context, Result, bail,
     config::*,
-    discovery, ensure,
+    discovery, ensure, mysql_network,
     platform::{self, Identity, Process},
     protocol, service_config,
 };
@@ -31,12 +31,27 @@ struct Record {
     identity: Identity,
     ports: Vec<u16>,
     config: PathBuf,
+    #[serde(default)]
+    mysql_dual_loopback: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     redis_auth: Option<Vec<u8>>,
 }
 struct Running {
     record: Record,
     process: Process,
+}
+impl Running {
+    fn listening(&self) -> bool {
+        self.record.ports.iter().all(|port| {
+            if self.record.kind == Kind::Mysql {
+                mysql_network::listeners(*port, self.record.mysql_dual_loopback)
+                    .into_iter()
+                    .all(|address| self.process.owns_listener(address).unwrap_or(false))
+            } else {
+                self.process.owns_port(*port).unwrap_or(false)
+            }
+        })
+    }
 }
 #[derive(Serialize, Deserialize)]
 struct RuntimeState {
@@ -207,9 +222,7 @@ impl Engine {
             fs::read(&candidate)? == config_bytes,
             "检查后配置发生变化，请重新检查"
         );
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, spec.port))
-            .context("MySQL 端口被占用，未访问占用服务")?;
-        drop(listener);
+        mysql_network::preflight(spec.port, mysql_network::dual_loopback(&package.version)?)?;
         let conf = service_config::commit(&self.layout, &format!("mysql:{}", spec.id), &candidate)?;
         let pending = self
             .layout
@@ -647,13 +660,8 @@ impl Engine {
                 1
             };
             let listeners_ready = entries.is_some_and(|v| {
-                v.iter().all(|p| {
-                    !p.record.ports.is_empty()
-                        && p.record
-                            .ports
-                            .iter()
-                            .all(|port| p.process.owns_port(*port).unwrap_or(false))
-                })
+                v.iter()
+                    .all(|p| !p.record.ports.is_empty() && p.listening())
             });
             let initializing = entries.is_some_and(|v| {
                 v.iter()
@@ -772,13 +780,7 @@ impl Engine {
                 "{id} 正在初始化，请等待完成并检查日志"
             );
             if entries.len() == expected
-                && entries.iter().all(|p| {
-                    p.process.running()
-                        && p.record
-                            .ports
-                            .iter()
-                            .all(|port| p.process.owns_port(*port).unwrap_or(false))
-                })
+                && entries.iter().all(|p| p.process.running() && p.listening())
             {
                 return Ok(());
             }
@@ -824,8 +826,26 @@ impl Engine {
         ports: Vec<u16>,
         config: PathBuf,
     ) -> Result<()> {
+        let mysql_dual_loopback = if kind == Kind::Mysql {
+            let spec = self
+                .config
+                .mysql
+                .iter()
+                .find(|spec| id == format!("mysql:{}", spec.id))
+                .context("MySQL 服务不存在")?;
+            mysql_network::dual_loopback(&self.package(&spec.package, Kind::Mysql)?.version)?
+        } else {
+            false
+        };
+        if kind == Kind::Mysql {
+            for port in &ports {
+                mysql_network::preflight(*port, mysql_dual_loopback)?;
+            }
+        }
         let listeners = if kind == Kind::Apache {
             self.config.http_listeners()?
+        } else if kind == Kind::Mysql {
+            vec![]
         } else {
             ports.iter().map(|p| (Ipv4Addr::LOCALHOST, *p)).collect()
         };
@@ -861,6 +881,7 @@ impl Engine {
             identity: process.identity.clone(),
             ports,
             config,
+            mysql_dual_loopback,
             redis_auth,
         };
         self.running
@@ -876,11 +897,7 @@ impl Engine {
                 .and_then(|v| v.last())
                 .context("进程记录丢失")?;
             ensure!(p.process.running(), "{id} 已退出，查看 {}", log.display());
-            if p.record
-                .ports
-                .iter()
-                .all(|port| p.process.owns_port(*port).unwrap_or(false))
-            {
+            if p.listening() {
                 return Ok(());
             }
             ensure!(
@@ -1286,10 +1303,11 @@ impl Engine {
                 .path(format!("config/overrides/mysql/{}.ini", spec.id))?,
         )?;
         let mut text = format!(
-            "[mysqld]\nbasedir=\"{}\"\ndatadir=\"{}\"\nport={}\nbind-address=127.0.0.1\nlog-error=\"{}\"\npid-file=\"{}\"\ntmpdir=\"{}\"\nsecure-file-priv=NULL\nlocal-infile=0\n",
+            "[mysqld]\nbasedir=\"{}\"\ndatadir=\"{}\"\nport={}\nbind-address={}\nlog-error=\"{}\"\npid-file=\"{}\"\ntmpdir=\"{}\"\nsecure-file-priv=NULL\nlocal-infile=0\n",
             apache_path(&p.directory)?,
             apache_path(&dir)?,
             spec.port,
+            mysql_network::bind_address(&p.version)?,
             apache_path(&self.layout.path(format!("logs/{}-error.log", spec.id))?)?,
             apache_path(&self.layout.path(format!("runtime/state/{}.pid", spec.id))?)?,
             apache_path(&self.layout.path("runtime/temp")?)?
@@ -1350,6 +1368,7 @@ impl Engine {
             .context("MySQL 实例不存在")?
             .clone();
         let p = self.package(&spec.package, Kind::Mysql)?.clone();
+        mysql_network::preflight(spec.port, mysql_network::dual_loopback(&p.version)?)?;
         let candidate = self.mysql_config(&spec)?;
         let conf = service_config::commit(&self.layout, &format!("mysql:{id}"), &candidate)?;
         let dir = spec.data_path(&self.layout)?;
@@ -1387,6 +1406,7 @@ impl Engine {
                         identity: process.identity.clone(),
                         ports: vec![],
                         config: conf.clone(),
+                        mysql_dual_loopback: false,
                         redis_auth: None,
                     },
                     process,

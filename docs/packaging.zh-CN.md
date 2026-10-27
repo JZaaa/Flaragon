@@ -11,6 +11,8 @@
 
 `scripts/package.ps1` 会自动加载 `scripts/env.ps1`，将缓存、编译输出和临时目录定向到项目内，不需要手动配置系统 PATH。
 
+从 0.0.4 起，发布脚本从 CHANGELOG 的正式版本标题（`# x.y.z`，不含“未发布”标记）选择小于目标版本的最大版本，写入清单 `minimum_version`；运行时将其作为唯一允许的来源版本。缺少上一正式版本时拒绝组包，不用版本号减一推算，也不依赖本机是否保留对应 `dist` 目录。`release-policy.json` 的 `minimum_version` 仅用于 0.0.3 及更早版本，`excluded_versions` 和 `remove` 继续生效。规则检查由 `scripts/test-release-policy.py` 执行，打包入口会先运行该检查。
+
 ## 完整打包
 
 在项目根目录运行：
@@ -29,30 +31,38 @@
 
 `-SkipBuild` 仍执行许可收集、自检和组包，不能用来跳过失败的检查或发布旧构建。
 
-生成后，执行真实 EXE 安装与升级验收：
+生成后，执行真实 EXE 安装与升级验收。以下为 0.0.3 归档对应的验收命令：
 
 ```powershell
 . .\scripts\env.ps1
 & .\.tools\python\python.exe .\scripts\acceptance-release.py --baseline 0.0.1 --repair .\dist\repairs\php-version-0.0.1\update.exe
+& .\.tools\python\python.exe .\scripts\acceptance-release.py --baseline 0.0.2 --repair .\dist\repairs\latest-dev-0.0.2\update.exe
+& .\.tools\python\python.exe .\scripts\acceptance-release.py --baseline 0.0.2 --repair .\dist\repairs\redis-refresh-0.0.2\update.exe
+& .\.tools\python\python.exe .\scripts\acceptance-release.py --baseline 0.0.2 --repair .\dist\repairs\redis-refresh-0.0.2\update.exe --repair .\dist\repairs\latest-dev-from-redis-refresh-0.0.2\update.exe
+& .\.tools\python\python.exe .\scripts\acceptance-release.py --baseline 0.0.2 --baseline-release .\dist\rebuilds\latest-dev-0.0.2
 ```
 
-该脚本仅在项目的 `testwork` 中新建独立安装目录，检查安装载荷、版本自检、原始及已修复安装升级、用户文件与修改时间保留、运行占用拒绝、多环境隔离及中断续修，不启动组件服务。结果保存在 `testwork/evidence/release-<版本>.json`，不替代 GUI、真实组件或跨机器验证。`--baseline` 指定已归档的低版本安装包；`--repair` 为可选的对应基线修复包。
+该脚本仅在项目的 `testwork` 中新建独立安装目录，检查安装载荷、版本自检、原始及已修复安装升级、用户文件与修改时间保留、运行占用拒绝、多环境隔离及中断续修，不启动组件服务。结果按目标归档、基线归档及最后应用的补丁标识分别保存在 `testwork/evidence/release-*.json`，不替代 GUI、真实组件或跨机器验证。`--baseline` 指定已归档的低版本；`--repair` 可重复指定，按顺序应用对应基线修复包；`--baseline-release` 指定独立重打包归档。
+
+从 0.0.4 起，`--baseline` 必须指定上一正式版本，使用 `--rejected-baseline` 指定应拒绝的更旧版本；该参数可重复，验证检查和执行阶段均拒绝跳版且不替换文件。例如用户明确发布 0.0.4 并完成组包后，运行 `scripts/acceptance-release.py --baseline 0.0.3 --rejected-baseline 0.0.2`。此示例不表示已有 0.0.4 发布包。
 
 ## 输出与命名
 
-输出目录为项目内的 `dist/<版本>/`。如 0.0.2 的文件如下：
+输出目录为项目内的 `dist/<版本>/`。0.0.3 的产物如下：
 
 | 文件 | 用途 |
 | --- | --- |
-| `dist/0.0.2/Flaragon-Setup-0.0.2-x64.exe` | 新环境安装包 |
-| `dist/0.0.2/Flaragon-Update-0.0.2-x64.exe` | 已有正式安装的升级包 |
-| `dist/0.0.2/payload/` | 组包载荷，含 Flaragon.exe、编辑器 DLL、许可和发布清单 |
-| `dist/0.0.2/release.json` | 发布版本、架构、兼容范围及文件清单 |
-| `dist/0.0.2/build-info.json` | 构建来源、包内容和签名状态说明 |
+| `dist/0.0.3/Flaragon-Setup-0.0.3-x64.exe` | 新环境安装包 |
+| `dist/0.0.3/Flaragon-Update-0.0.3-x64.exe` | 已有正式安装的升级包 |
+| `dist/0.0.3/payload/` | 组包载荷，含 Flaragon.exe、编辑器 DLL、许可和发布清单 |
+| `dist/0.0.3/release.json` | 发布版本、架构、兼容范围及文件清单 |
+| `dist/0.0.3/build-info.json` | 构建来源、包内容和签名状态说明 |
 
 通用命名为 `Flaragon-Setup-<版本>-x64.exe` 和 `Flaragon-Update-<版本>-x64.exe`。对外提供安装 EXE 即可，不需要附带源码、Rust 或打包脚本。
 
-新环境使用 Setup 包；已有 0.0.1 正式安装使用 Update 包，已安装 PHP 专用修复包的 0.0.1 也在兼容范围内。最低兼容版本为 0.0.1。升级前在目标环境“停止并退出”，再运行 Update，选择安装目录，点击“检查目录 → 开始升级”。同版本、降级和无安装清单目录拒绝；实际验收范围以对应发布验证证据为准。
+0.0.1 归档仅包含 Setup，不提供该版本的 Update；从 0.0.1 升级时使用目标版本的 Update。
+
+新环境使用 Setup 包；已有 0.0.1、0.0.2 正式安装使用 Update 包，兼容范围包括对应的已归档补丁及独立重打包构建，最低兼容版本为 0.0.1。升级前在目标环境“停止并退出”，再运行 Update，选择安装目录，点击“检查目录 → 开始升级”。同版本、降级和无安装清单目录拒绝；实际验收范围以对应发布验证证据为准。
 
 ## 产物范围与检查
 
@@ -75,8 +85,8 @@
 
 | 修复包 | 适用安装 | 内容 |
 | --- | --- | --- |
-| `dist/repairs/latest-dev-from-redis-refresh-0.0.2/update.exe` | 已应用 `redis-refresh-0.0.2` 的 0.0.2 安装 | 更新至当前开发程序，包含 PHP 8.4 以上 NTS 识别修正 |
-| `dist/repairs/latest-dev-0.0.2/update.exe` | 原始 0.0.2 正式安装 | 当前开发功能及 PHP 8.4 以上 NTS 识别修正；保留 Redis 认证与组件刷新功能 |
+| `dist/repairs/latest-dev-from-redis-refresh-0.0.2/update.exe` | 已应用 `redis-refresh-0.0.2` 的 0.0.2 安装 | PHP 8.4 以上 NTS 识别修正及对应归档构建的功能 |
+| `dist/repairs/latest-dev-0.0.2/update.exe` | 原始 0.0.2 正式安装 | PHP 8.4 以上 NTS 识别修正；保留 Redis 认证与组件刷新功能 |
 | `dist/repairs/redis-refresh-0.0.2/update.exe` | 原始 0.0.2 正式安装 | Redis 密码配置与认证启停、环境设置组件刷新 |
 | `dist/repairs/php-version-0.0.1/update.exe` | 原始 0.0.1 正式安装 | PHP 完整版本识别，不包含 MySQL 数据接入 |
 

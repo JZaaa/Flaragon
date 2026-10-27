@@ -585,6 +585,14 @@ fn upgrade_allowed(old: &Manifest, next: &Manifest) -> Result<()> {
         version(&next.version)? > version(&old.version)?,
         "当前版本相同或更高，已终止更新；不支持降级"
     );
+    if version(&next.version)? >= [0, 0, 4] {
+        ensure!(
+            old.version == next.minimum_version,
+            "此升级包仅支持从上一正式版本 {} 升级，当前为 {}；请按正式版本顺序升级",
+            next.minimum_version,
+            old.version
+        );
+    }
     ensure!(
         version(&old.version)? >= version(&next.minimum_version)?
             && !next.excluded_versions.contains(&old.version),

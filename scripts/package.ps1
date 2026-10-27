@@ -1,6 +1,8 @@
 param([switch]$SkipBuild, [string]$BuildId)
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot\env.ps1"
+& "$taskRoot\.tools\python\python.exe" "$PSScriptRoot\test-release-policy.py"
+if ($LASTEXITCODE -ne 0) { throw '升级版本规则检查失败' }
 if (-not $SkipBuild) {
     & "$PSScriptRoot\build.ps1"
 }

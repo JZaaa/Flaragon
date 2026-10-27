@@ -5,6 +5,7 @@ pub mod discovery;
 pub mod engine;
 pub mod hosts;
 pub mod mysql_data;
+pub mod mysql_network;
 pub mod platform;
 pub mod protocol;
 pub mod redis_config;

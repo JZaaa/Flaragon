@@ -26,6 +26,25 @@ def checked(path):
     return path
 
 
+def upgrade_minimum(version, policy, changelog):
+    def number(value):
+        if not re.fullmatch(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', value):
+            raise ValueError(f'Invalid release version: {value}')
+        parts = tuple(map(int, value.split('.')))
+        if any(part > 65535 for part in parts):
+            raise ValueError(f'Release version exceeds manifest limits: {value}')
+        return parts
+
+    target = number(version)
+    if target < (0, 0, 4):
+        return policy['minimum_version']
+    published = re.findall(r'^# ([0-9]+\.[0-9]+\.[0-9]+)\s*$', changelog, re.MULTILINE)
+    older = [(number(value), value) for value in published if number(value) < target]
+    if not older:
+        raise ValueError('Previous published version is missing from CHANGELOG.md')
+    return max(older)[1]
+
+
 def build_payload(version, release_id):
     build = checked(ROOT / 'target/x86_64-pc-windows-msvc/release')
     files = {'Flaragon.exe': checked(build / 'Flaragon.exe').read_bytes()}
@@ -38,9 +57,10 @@ def build_payload(version, release_id):
             path = checked(Path(folder) / name)
             files[path.relative_to(ROOT).as_posix()] = path.read_bytes()
     policy = json.loads(checked(ROOT / 'release-policy.json').read_text(encoding='utf-8'))
+    minimum = upgrade_minimum(version, policy, checked(ROOT / 'CHANGELOG.md').read_text(encoding='utf-8'))
     manifest = {'product': 'Flaragon', 'version': version, 'release_id': release_id,
                 'architecture': 'x86_64-pc-windows-msvc', 'format': 1,
-                'config_schema': 1, 'minimum_version': policy['minimum_version'],
+                'config_schema': 1, 'minimum_version': minimum,
                 'files': {name: len(data) for name, data in sorted(files.items())},
                 'remove': policy['remove'], 'excluded_versions': policy['excluded_versions']}
     files['release.json'] = json.dumps(manifest, ensure_ascii=False, indent=2).encode('utf-8')

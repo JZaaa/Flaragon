@@ -3,6 +3,7 @@ use std::{
     ffi::OsStr,
     fs,
     io::Read,
+    net::{IpAddr, SocketAddr},
     os::windows::{
         ffi::OsStrExt,
         io::{AsRawHandle, FromRawHandle, OwnedHandle},
@@ -14,8 +15,11 @@ use std::{
     time::{Duration, Instant},
 };
 use windows_sys::Win32::{
-    Foundation::*, NetworkManagement::IpHelper::*, Networking::WinSock::AF_INET,
-    Storage::FileSystem::*, System::Threading::*,
+    Foundation::*,
+    NetworkManagement::IpHelper::*,
+    Networking::WinSock::{AF_INET, AF_INET6},
+    Storage::FileSystem::*,
+    System::Threading::*,
 };
 
 pub mod deployment;
@@ -324,6 +328,16 @@ pub fn copy_text(text: &str) -> Result<()> {
 }
 
 pub fn listening_pid(port: u16) -> Result<Option<u32>> {
+    tcp_listener_pid(port, None)
+}
+
+pub fn listening_pid_at(address: SocketAddr) -> Result<Option<u32>> {
+    tcp_listener_pid(address.port(), Some(address.ip()))
+}
+
+fn tcp_listener_pid(port: u16, address: Option<IpAddr>) -> Result<Option<u32>> {
+    let ipv6 = matches!(address, Some(IpAddr::V6(_)));
+    let family = if ipv6 { AF_INET6 } else { AF_INET } as u32;
     // SAFETY: Initial call requests size. u64 storage ensures alignment for TCP table rows.
     unsafe {
         let mut bytes = 0;
@@ -331,7 +345,7 @@ pub fn listening_pid(port: u16) -> Result<Option<u32>> {
             std::ptr::null_mut(),
             &mut bytes,
             0,
-            AF_INET as u32,
+            family,
             TCP_TABLE_OWNER_PID_LISTENER,
             0,
         );
@@ -345,7 +359,7 @@ pub fn listening_pid(port: u16) -> Result<Option<u32>> {
                 storage.as_mut_ptr().cast(),
                 &mut bytes,
                 0,
-                AF_INET as u32,
+                family,
                 TCP_TABLE_OWNER_PID_LISTENER,
                 0,
             );
@@ -354,15 +368,36 @@ pub fn listening_pid(port: u16) -> Result<Option<u32>> {
             }
             ensure!(code == 0, "读取端口归属失败：{code}");
             let base = storage.as_ptr().cast::<u8>();
+            ensure!(
+                bytes >= 4 && bytes as usize <= storage.len() * 8,
+                "TCP 表长度异常"
+            );
             let count = std::ptr::read_unaligned(base.cast::<u32>()) as usize;
-            let row_size = std::mem::size_of::<MIB_TCPROW_OWNER_PID>();
-            ensure!(4 + count * row_size <= storage.len() * 8, "TCP 表长度异常");
+            let row_size = if ipv6 {
+                std::mem::size_of::<MIB_TCP6ROW_OWNER_PID>()
+            } else {
+                std::mem::size_of::<MIB_TCPROW_OWNER_PID>()
+            };
+            ensure!(count <= (bytes as usize - 4) / row_size, "TCP 表长度异常");
             for i in 0..count {
-                let row = std::ptr::read_unaligned(
-                    base.add(4 + i * row_size).cast::<MIB_TCPROW_OWNER_PID>(),
-                );
-                if u16::from_be(row.dwLocalPort as u16) == port {
-                    return Ok(Some(row.dwOwningPid));
+                let pointer = base.add(4 + i * row_size);
+                let (local, local_port, pid) = if ipv6 {
+                    let row = std::ptr::read_unaligned(pointer.cast::<MIB_TCP6ROW_OWNER_PID>());
+                    (
+                        IpAddr::from(row.ucLocalAddr),
+                        row.dwLocalPort,
+                        row.dwOwningPid,
+                    )
+                } else {
+                    let row = std::ptr::read_unaligned(pointer.cast::<MIB_TCPROW_OWNER_PID>());
+                    (
+                        IpAddr::from(row.dwLocalAddr.to_ne_bytes()),
+                        row.dwLocalPort,
+                        row.dwOwningPid,
+                    )
+                };
+                if u16::from_be(local_port as u16) == port && address.is_none_or(|a| a == local) {
+                    return Ok(Some(pid));
                 }
             }
             return Ok(None);
@@ -627,10 +662,16 @@ impl Process {
         self.wait(Duration::from_secs(5))
     }
     pub fn owns_port(&self, port: u16) -> Result<bool> {
+        self.owns_listener_pid(listening_pid(port)?)
+    }
+    pub fn owns_listener(&self, address: SocketAddr) -> Result<bool> {
+        self.owns_listener_pid(listening_pid_at(address)?)
+    }
+    fn owns_listener_pid(&self, listener: Option<u32>) -> Result<bool> {
         if !self.running() {
             return Ok(false);
         }
-        if let Some(pid) = listening_pid(port)? {
+        if let Some(pid) = listener {
             if pid == self.identity.pid {
                 return Ok(true);
             }

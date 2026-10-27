@@ -23,9 +23,20 @@ def copy_tree(source, target, ignore=None):
 def free_ports(count):
     sockets = []
     try:
-        for _ in range(count):
-            s=socket.socket(); sockets.append(s); s.bind(('127.0.0.1',0))
-        return [s.getsockname()[1] for s in sockets]
+        ports = []
+        # Avoid ephemeral client ports being reused by SQL connections before the conflict test.
+        for port in range(24000, 32000):
+            pair = [socket.socket(), socket.socket(socket.AF_INET6)]
+            try:
+                pair[0].bind(('127.0.0.1', port))
+                pair[1].bind(('::1', port))
+            except OSError:
+                for s in pair: s.close()
+                continue
+            sockets.extend(pair)
+            ports.append(port)
+            if len(ports) == count: return ports
+        raise RuntimeError('Not enough isolated test ports')
     finally:
         for s in sockets: s.close()
 
@@ -91,6 +102,22 @@ def main():
                 occupied.bind(('127.0.0.1',target['port'])); occupied.listen()
                 call('mysql_adopt',expect=False,confirmation=confirm(r))
             assert not checked(directory(target)/'.flaragon-binding.json').exists()
+            if p['version'].startswith('8.'):
+                r=review(target)
+                with socket.socket(socket.AF_INET6) as occupied:
+                    occupied.bind(('::1',target['port'])); occupied.listen()
+                    occupied.settimeout(0.2)
+                    result=call('mysql_adopt',expect=False,confirmation=confirm(r))
+                    assert '[::1]' in result['error'],result['error']
+                    assert not checked(directory(target)/'.flaragon-adopting.json').exists()
+                    try:
+                        connection,_=occupied.accept()
+                    except TimeoutError:
+                        pass
+                    else:
+                        connection.close()
+                        raise AssertionError('Connected to occupied IPv6 listener')
+                assert not checked(directory(target)/'.flaragon-binding.json').exists()
             r=review(target); call('mysql_adopt',confirmation=confirm(r))
             assert not any(row['running'] for row in session.snapshot['rows'])
             binding=json.loads(checked(directory(target)/'.flaragon-binding.json').read_bytes())

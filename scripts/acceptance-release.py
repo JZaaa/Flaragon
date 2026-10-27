@@ -18,7 +18,9 @@ checked = builder.checked
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--baseline', required=True)
-    parser.add_argument('--repair', type=Path)
+    parser.add_argument('--rejected-baseline', action='append', default=[], help='Older release that this updater must reject')
+    parser.add_argument('--repair', type=Path, action='append', help='Apply baseline repairs in the supplied order')
+    parser.add_argument('--baseline-release', type=Path, help='Archived same-version rebuild used as the upgrade baseline')
     parser.add_argument('--release', type=Path, help='Separate rebuild archive to validate')
     args = parser.parse_args()
     assert os.environ.get('FLARAGON_DEV_ROOT', '').lower() == str(ROOT).lower()
@@ -33,7 +35,9 @@ def main():
     assert all(name in expected or name.startswith('licenses/') for name in manifest['files'])
     setup = checked(release / f'Flaragon-Setup-{current}-x64.exe')
     update = checked(release / f'Flaragon-Update-{current}-x64.exe')
-    old_setup = checked(ROOT / 'dist' / args.baseline / f'Flaragon-Setup-{args.baseline}-x64.exe')
+    old_release = checked(args.baseline_release.absolute()) if args.baseline_release else checked(ROOT / 'dist' / args.baseline)
+    old_setup = checked(old_release / f'Flaragon-Setup-{args.baseline}-x64.exe')
+    old_update = checked(old_release / f'Flaragon-Update-{args.baseline}-x64.exe')
     cli = checked(ROOT / 'target/x86_64-pc-windows-msvc/release/flaragon-cli.exe')
     base = checked(ROOT / 'testwork' / ('release-' + current + '-' + uuid.uuid4().hex[:12]))
     base.mkdir(parents=True)
@@ -95,7 +99,8 @@ def main():
     if args.repair:
         repaired = base / 'repaired'
         call(old_setup, '--apply', repaired)
-        call(checked(args.repair.absolute()), '--apply', repaired)
+        for repair in args.repair:
+            call(checked(repair.absolute()), '--apply', repaired)
         targets.append(repaired)
     for target in targets:
         sentinels = {'config/app.json': json.dumps(response['snapshot']['config']).encode(),
@@ -115,6 +120,9 @@ def main():
         record(f'{target.name} baseline upgrade preserves bytes, mtimes, identity and other installation')
     before = program(old)
     call(update, '--apply', old, False)
+    if old_update.exists():
+        call(old_update, '--apply', old, False)
+        record('archived older updater refuses downgrade')
     call(setup, '--apply', old, False)
     assert before == program(old)
     call(update, '--inspect', ROOT, False)
@@ -136,11 +144,26 @@ def main():
     verify(resume)
     assert not checked(resume / '.maintenance/active.json').exists()
     record('same release completes interrupted upgrade with main executable already replaced')
+    for rejected in args.rejected_baseline:
+        assert len(rejected.split('.')) == 3 and all(p.isascii() and p.isdigit() for p in rejected.split('.'))
+        rejected_setup = checked(ROOT / 'dist' / rejected / f'Flaragon-Setup-{rejected}-x64.exe')
+        target = base / ('rejected-' + rejected)
+        call(rejected_setup, '--apply', target)
+        before = program(target)
+        for action in ['--inspect', '--apply']:
+            result = call(update, action, target, False)
+            assert '上一正式版本' in result['error'], result
+        assert before == program(target) and not checked(target / '.maintenance/active.json').exists()
+        record(f'non-predecessor {rejected} rejected before replacement')
     evidence = dict(version=current, release=str(release), release_id=manifest['release_id'],
-        baseline=args.baseline, fixture_root=str(base), checks=results,
+        baseline=args.baseline, baseline_release=str(old_release),
+        repairs=[str(checked(p.absolute())) for p in (args.repair or [])], fixture_root=str(base), checks=results,
+        rejected_baselines=args.rejected_baseline,
         stopped=True, limits=['User files are independent sentinels; no database compatibility claim',
                               'Cross-machine, DPI and actual power-loss faults not tested'])
-    evidence_name = release.name if args.release else current
+    evidence_name = (release.name if args.release else current) + '-from-' + old_release.name
+    if args.repair:
+        evidence_name += '-' + args.repair[-1].parent.name
     write(ROOT, f'testwork/evidence/release-{evidence_name}.json', json.dumps(evidence, ensure_ascii=False, indent=2).encode())
     print(json.dumps(evidence, ensure_ascii=False, indent=2))
 
