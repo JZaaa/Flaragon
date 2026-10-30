@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import struct
 import tomllib
 import uuid
 
@@ -25,7 +26,9 @@ def main():
     args = parser.parse_args()
     assert os.environ.get('FLARAGON_DEV_ROOT', '').lower() == str(ROOT).lower()
     current = tomllib.loads(checked(ROOT / 'Cargo.toml').read_text(encoding='utf-8'))['package']['version']
-    assert tuple(map(int, args.baseline.split('.'))) < tuple(map(int, current.split('.')))
+    assert tuple(map(int, args.baseline.split('.'))) <= tuple(map(int, current.split('.')))
+    if args.baseline == current:
+        assert args.baseline_release, 'Same-version acceptance requires an explicit original archive'
     release = checked(args.release.absolute()) if args.release else checked(ROOT / 'dist' / current)
     manifest = json.loads(checked(release / 'release.json').read_bytes())
     assert manifest['version'] == current
@@ -71,7 +74,21 @@ def main():
         subprocess.run([str(checked(target / 'Flaragon.exe')), '--deployment-check', current, str(target)],
             check=True, timeout=25, creationflags=subprocess.CREATE_NO_WINDOW)
 
-    fresh, old, independent, resume = [base / name for name in ['新安装 中文 空格', 'original', 'independent', 'resume']]
+    unbound = wrong_bound = None
+    if args.baseline == current:
+        packed = update.read_bytes()
+        length = struct.unpack('<Q', packed[-25:-17])[0]
+        stub = packed[:-25-length]
+        payload = {name: checked(release / 'payload' / name).read_bytes()
+                   for name in [*manifest['files'], 'release.json']}
+        unbound = base / 'unbound-update.exe'
+        builder.write_package(stub, builder.archive(payload), unbound, 1)
+        wrong_base = json.loads(checked(release / 'update-base.json').read_bytes())
+        wrong_base['release_id'] = 'a' * 32
+        wrong_bound = base / 'wrong-bound-update.exe'
+        builder.write_package(stub, builder.archive({**payload, 'update-base.json': json.dumps(wrong_base).encode()}), wrong_bound, 1)
+
+    fresh, old, independent, resume = [base / name for name in ['fresh install space', 'original', 'independent', 'resume']]
     call(setup, '--inspect', fresh)
     assert not fresh.exists()
     call(setup, '--apply', fresh)
@@ -79,9 +96,30 @@ def main():
     assert not checked(fresh / 'data').exists() and not checked(fresh / 'config').exists()
     assert all(not any(checked(fresh / 'bin' / kind).iterdir()) for kind in ['apache', 'php', 'mysql', 'redis'])
     record('software-only fresh installation, exact payload and executable self-check')
+    for target in [base / '中文目录', base / '中文父目录' / 'environment']:
+        for action in ['--inspect', '--apply']:
+            result = call(setup, action, target, False)
+            assert '中文' in result['error'], result
+        assert not target.exists() and not (base / '中文父目录').exists()
+    record('Chinese target directory and parent rejected before creation')
     for target in [old, independent, resume]:
         call(old_setup, '--apply', target)
     independent_before = program(independent)
+    if args.baseline == current:
+        for candidate in [unbound, wrong_bound]:
+            call(candidate, '--apply', independent, False)
+            assert program(independent) == independent_before
+        saved = checked(independent / 'release.json').read_bytes()
+        wrong = json.loads(saved)
+        wrong['release_id'] = 'a' * 32
+        write(independent, 'release.json', json.dumps(wrong).encode())
+        before = program(independent)
+        for action in ['--inspect', '--apply']:
+            rejected = call(update, action, independent, False)
+            assert '原始构建' in rejected['error'], rejected
+        assert program(independent) == before
+        write(independent, 'release.json', saved)
+        record('unknown same-version build rejected without changing program files')
     assert checked(old / '.flaragon-install.json').read_bytes() != checked(independent / '.flaragon-install.json').read_bytes()
     process = subprocess.Popen([str(cli), str(old)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, encoding='utf-8', creationflags=subprocess.CREATE_NO_WINDOW)
@@ -111,7 +149,9 @@ def main():
             write(target, name, data)
         preserved = {name: (checked(target / name).read_bytes(), checked(target / name).stat().st_mtime_ns)
                      for name in [*sentinels, '.flaragon-install.json']}
-        call(update, '--inspect', target)
+        inspection = call(update, '--inspect', target)
+        if args.baseline == current:
+            assert '同版本覆盖升级' in inspection['message']
         call(update, '--apply', target)
         verify(target)
         assert all((checked(target / name).read_bytes(), checked(target / name).stat().st_mtime_ns) == value
@@ -140,6 +180,12 @@ def main():
         write(resume, f'.maintenance/{token}/new/{name}', checked(release / 'payload' / name).read_bytes())
     write(resume, '.maintenance/active.json', json.dumps(journal).encode())
     write(resume, 'Flaragon.exe', checked(release / 'payload/Flaragon.exe').read_bytes())
+    if args.baseline == current:
+        before = program(resume)
+        for candidate in [unbound, wrong_bound]:
+            call(candidate, '--apply', resume, False)
+            assert program(resume) == before
+        record('interrupted same-version update rejects absent or mismatched baseline binding')
     call(update, '--apply', resume)
     verify(resume)
     assert not checked(resume / '.maintenance/active.json').exists()

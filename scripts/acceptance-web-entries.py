@@ -92,9 +92,9 @@ def main():
         config.update(http_port=28180, http_address='127.0.0.1', apache_usage='common')
         for index, php in enumerate(config['php']):
             php.update(port=29200 + index * 8, usage='normal', directory_entry=dict(enabled=True, port=28174 + index,
-                       directory=str(SITE_ROOT / 'www/目录 测试') if EXTERNAL_SITES else 'www/目录 测试', address='127.0.0.1'))
+                       directory=str(SITE_ROOT / 'www/directory test') if EXTERNAL_SITES else 'www/directory test', address='127.0.0.1'))
         config['projects'] = []
-        write(SITE_ROOT / 'www/目录 测试/free/index.php', '<?php header("Content-Type: application/json"); echo json_encode(["version"=>PHP_VERSION,"uri"=>$_SERVER["REQUEST_URI"]]);')
+        write(SITE_ROOT / 'www/directory test/free/index.php', '<?php header("Content-Type: application/json"); echo json_encode(["version"=>PHP_VERSION,"uri"=>$_SERVER["REQUEST_URI"]]);')
         session.call('apply', config=config)
         session.call('start', id='apache')
         for php in config['php']:
@@ -115,7 +115,7 @@ header('Content-Type: application/json');
 echo json_encode(['version'=>PHP_VERSION,'uri'=>$_SERVER['REQUEST_URI'],'script'=>$_SERVER['SCRIPT_NAME'], 'root'=>$_SERVER['DOCUMENT_ROOT'], 'visits'=>$_SESSION['visits'],'method'=>$_SERVER['REQUEST_METHOD'],'data'=>file_get_contents('php://input')]);
 '''
         for i in range(24):
-            folder = 'www/目录 测试/站点 ' + str(i)
+            folder = 'www/directory test/site ' + str(i)
             if EXTERNAL_SITES:
                 folder = str(SITE_ROOT / folder)
             write(ROOT / folder / 'webroot/index.php', script)

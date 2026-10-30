@@ -173,6 +173,9 @@ pub fn command(exe: &Path, root: &Path, cwd: &Path) -> Command {
     cmd.env_clear()
         .env("SystemRoot", &system)
         .env("WINDIR", &system);
+    if let Some(boundary) = std::env::var_os("FLARAGON_DEV_ROOT") {
+        cmd.env("FLARAGON_DEV_ROOT", boundary);
+    }
     let paths = [
         exe.parent().unwrap_or(root).to_path_buf(),
         std::path::PathBuf::from(&system).join("System32"),

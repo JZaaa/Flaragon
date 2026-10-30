@@ -185,8 +185,10 @@ def main():
         session.call('stop_all')
         session.close()
         session = None
-        files = [ROOT / 'config/paths.json', ROOT / 'config/app.json', *list((ROOT / 'config/services').rglob('*.ini')),
-                 *list((ROOT / 'config/services').rglob('*.conf')), *list((ROOT / 'config/services').rglob('*.managed.json'))]
+        files = [ROOT / 'config/paths.json', ROOT / 'config/app.json']
+        for directory in [ROOT / 'config/services/apache', ROOT / 'bin']:
+            files.extend(checked(p) for p in directory.rglob('*') if p.is_file() and
+                         (p.name in ['php.ini', 'my.ini', 'redis.conf', 'httpd.conf'] or p.name.endswith('.managed.json')))
         before = {str(p): (p.read_bytes(), p.stat().st_mtime_ns) for p in files}
         session = Session()
         session.call('scan')

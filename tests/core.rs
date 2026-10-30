@@ -11,7 +11,8 @@ fn rejects_path_escape_and_configuration_injection() {
     assert!(layout.path("../outside").is_err());
     assert!(layout.path("D:/flaragon-other/data").is_err());
     assert!(layout.path("C:/other/data").is_err());
-    assert!(layout.path("www/中文 空格/public").is_ok());
+    assert!(layout.path("www/中文 空格/public").is_err());
+    assert!(layout.path("www/site space/public").is_ok());
     for path in [
         "www/file:stream",
         "www/CON.txt",
@@ -203,11 +204,13 @@ fn hosts_file_transaction_is_confined_to_fixture_and_preserves_backup() {
 }
 
 #[test]
-fn discovery_preserves_custom_folder_names_and_distinguishes_unicode_packages() {
-    let layout =
-        Layout::new(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testwork/naming-unit"))
-            .unwrap();
-    for name in ["账务库 8.0", "报表库 8.0"] {
+fn discovery_preserves_custom_folder_names_and_distinguishes_packages() {
+    let layout = Layout::new(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+        "testwork/naming-unit-{}",
+        platform::random_token().unwrap()
+    )))
+    .unwrap();
+    for name in ["accounts 8.0", "reports 8.0"] {
         let directory = layout.path(format!("bin/mysql/{name}/nested/bin")).unwrap();
         std::fs::create_dir_all(&directory).unwrap();
         // Invalid executable fixtures exercise discovery labels without starting any service.
@@ -216,7 +219,7 @@ fn discovery_preserves_custom_folder_names_and_distinguishes_unicode_packages() 
     let packages = discovery::scan(&layout).unwrap();
     assert_eq!(packages.len(), 2);
     assert_ne!(packages[0].id, packages[1].id);
-    for name in ["账务库 8.0", "报表库 8.0"] {
+    for name in ["accounts 8.0", "reports 8.0"] {
         let package = packages.iter().find(|p| p.label() == name).unwrap();
         assert!(package.error.is_some());
         assert!(package.directory.ends_with("nested"));

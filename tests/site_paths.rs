@@ -42,7 +42,7 @@ fn business_directories_can_be_outside_environment_but_managed_storage_cannot() 
         platform::random_token().unwrap()
     ));
     let layout = Layout::new(test_root.join("environment")).unwrap();
-    let business = test_root.join("业务 项目");
+    let business = test_root.join("business site");
     // Both siblings remain inside the repository's development boundary.
     layout.site_path(&business).unwrap();
     fs::create_dir_all(business.join("webroot")).unwrap();
@@ -93,4 +93,67 @@ fn business_directories_can_be_outside_environment_but_managed_storage_cannot() 
                 .contains("开发隔离范围")
         );
     }
+}
+
+#[test]
+fn chinese_directory_names_are_rejected_before_creation_or_execution() {
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("testwork/directory-policy")
+        .join(platform::random_token().unwrap());
+    for suffix in [
+        "中文",
+        "parent中文/environment",
+        "繁體/environment",
+        "𠀀/environment",
+    ] {
+        let path = base.join(suffix);
+        assert!(
+            Layout::new(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("不能包含中文")
+        );
+        assert!(
+            flaragon::deployment::target_root(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("不能包含中文")
+        );
+        assert!(!path.exists());
+    }
+    let layout = Layout::new(base.join("environment space")).unwrap();
+    for path in [
+        "www/中文",
+        "www/site/入口",
+        "bin/php/中文/php.exe",
+        "data/mysql/8.0/数据库",
+    ] {
+        assert!(layout.path(path).is_err());
+        assert!(layout.site_path(path).is_err());
+    }
+    let mysql = MysqlSpec {
+        id: "fixture".into(),
+        name: "数据库".into(),
+        package: "mysql-fixture".into(),
+        series: "8.0".into(),
+        port: 23306,
+        usage: ServiceUsage::Normal,
+        reuse_data: false,
+    };
+    assert!(
+        mysql
+            .data_path(&layout)
+            .unwrap_err()
+            .to_string()
+            .contains("不能包含中文")
+    );
+    let chinese_package = layout.root.join("bin/php/中文");
+    fs::create_dir_all(&chinese_package).unwrap();
+    fs::write(chinese_package.join("php.exe"), b"must never execute").unwrap();
+    assert!(
+        flaragon::discovery::scan(&layout)
+            .unwrap_err()
+            .to_string()
+            .contains("不能包含中文")
+    );
 }

@@ -48,7 +48,7 @@ def main():
         return {name: checked(folder / name).read_bytes() for name in names}
 
     record('initial_version_and_software_only_manifest')
-    first, second = base / '初始安装 中文 空格', base / 'independent install'
+    first, second = base / 'initial install space', base / 'independent install'
     deploy(setup, '--inspect', first)
     assert not first.exists()
     deploy(setup, '--apply', first)

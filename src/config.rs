@@ -170,6 +170,7 @@ pub struct MysqlSpec {
 }
 impl MysqlSpec {
     pub fn data_path(&self, layout: &Layout) -> Result<PathBuf> {
+        validate_directory_path(Path::new(&self.name))?;
         ensure!(
             valid_mysql_series(&self.series),
             "MySQL 版本目录无效，请选择有效组件并重新创建旧格式服务"
@@ -282,6 +283,7 @@ impl Layout {
         let root = root.as_ref();
         ensure!(root.is_absolute(), "环境根目录必须是绝对路径");
         let root = local_path(root, root)?;
+        validate_directory_path(&root)?;
         let development_root = std::env::var_os("FLARAGON_DEV_ROOT")
             .map(|value| {
                 let value = PathBuf::from(value);
@@ -312,8 +314,7 @@ impl Layout {
             "bin/php",
             "bin/mysql",
             "bin/redis",
-            "config/overrides/php",
-            "config/overrides/mysql",
+            "config/overrides",
             "data/mysql",
             "data/redis",
             "runtime/generated",
@@ -328,6 +329,7 @@ impl Layout {
     }
     pub fn path(&self, value: impl AsRef<Path>) -> Result<PathBuf> {
         let joined = local_path(&self.root, value.as_ref())?;
+        validate_directory_path(&joined)?;
         ensure!(
             path_within(&joined, &self.root),
             "路径不在环境根目录内：{}",
@@ -339,6 +341,7 @@ impl Layout {
     /// Business directories are independent of the environment's managed storage.
     pub fn site_path(&self, value: impl AsRef<Path>) -> Result<PathBuf> {
         let joined = local_path(&self.root, value.as_ref())?;
+        validate_directory_path(&joined)?;
         if let Some(boundary) = &self.development_root {
             ensure!(
                 path_within(&joined, boundary),
@@ -385,10 +388,6 @@ impl Layout {
     pub fn relative(&self, value: impl AsRef<Path>) -> Result<PathBuf> {
         let path = self.path(value)?;
         relative_to(&path, &self.root).context("无法取得环境内相对路径")
-    }
-    pub fn php_ini(&self, package: &str) -> Result<PathBuf> {
-        valid_id(package)?;
-        self.path(format!("config/overrides/php/{package}.ini"))
     }
 }
 
@@ -462,6 +461,18 @@ pub(crate) fn relative_to(path: &Path, base: &Path) -> Option<PathBuf> {
     })
 }
 
+/// Product directory names exclude Han characters; display labels remain unrestricted.
+pub fn validate_directory_path(path: &Path) -> Result<()> {
+    ensure!(
+        !path.to_string_lossy().chars().any(|c| matches!(c as u32,
+            0x3007 | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF
+            | 0x20000..=0x2FFFF | 0x30000..=0x3347F)),
+        "目录路径不能包含中文（包括父目录），请使用不含中文的目录：{}",
+        path.display()
+    );
+    Ok(())
+}
+
 pub fn reject_links(path: &Path) -> Result<()> {
     // Inspect parents before descendants so a junction is rejected before traversing it.
     for ancestor in path.ancestors().collect::<Vec<_>>().into_iter().rev() {
@@ -516,6 +527,77 @@ pub fn valid_domain(s: &str) -> Result<()> {
 }
 
 impl Config {
+    pub fn service_package(&self, id: &str) -> Result<(Kind, &str)> {
+        if id == "apache" {
+            return Ok((
+                Kind::Apache,
+                self.apache.as_deref().context("Apache 不存在")?,
+            ));
+        }
+        if id == "redis" {
+            return Ok((
+                Kind::Redis,
+                &self.redis.as_ref().context("Redis 不存在")?.package,
+            ));
+        }
+        if let Some(package) = id.strip_prefix("php:") {
+            return Ok((
+                Kind::Php,
+                &self
+                    .php
+                    .iter()
+                    .find(|p| p.package == package)
+                    .context("PHP 不存在")?
+                    .package,
+            ));
+        }
+        if let Some(instance) = id.strip_prefix("mysql:") {
+            return Ok((
+                Kind::Mysql,
+                &self
+                    .mysql
+                    .iter()
+                    .find(|p| p.id == instance)
+                    .context("MySQL 不存在")?
+                    .package,
+            ));
+        }
+        bail!("服务不存在")
+    }
+
+    pub fn without_service(&self, id: &str) -> Result<Self> {
+        let (kind, package) = self.service_package(id)?;
+        let mut next = self.clone();
+        match kind {
+            Kind::Apache => next.apache = None,
+            Kind::Redis => next.redis = None,
+            Kind::Mysql => next.mysql.retain(|s| id != format!("mysql:{}", s.id)),
+            Kind::Php => {
+                let projects = self
+                    .projects
+                    .iter()
+                    .filter(|p| {
+                        p.php
+                            .as_ref()
+                            .or(self.default_php.as_ref())
+                            .is_some_and(|p| p == package)
+                    })
+                    .map(|p| p.id.as_str())
+                    .collect::<Vec<_>>();
+                ensure!(
+                    projects.is_empty(),
+                    "请先为以下项目切换 PHP，再移除缺失组件：{}",
+                    projects.join("、")
+                );
+                next.php.retain(|s| s.package != package);
+                if next.default_php.as_deref() == Some(package) {
+                    next.default_php = None;
+                }
+            }
+        }
+        Ok(next)
+    }
+
     pub(crate) fn relativize_paths(&mut self, layout: &Layout) -> Result<()> {
         for value in self.projects.iter_mut().map(|p| &mut p.directory).chain(
             self.php
@@ -675,6 +757,7 @@ impl Config {
         let mut ids = std::collections::BTreeSet::new();
         for spec in &self.php {
             valid_id(&spec.package)?;
+            validate_directory_path(&spec.directory_entry.directory)?;
             ensure!(ids.insert(spec.package.clone()), "PHP 配置重复");
             ensure!((1..=8).contains(&spec.workers), "PHP worker 数量应为 1–8");
             if spec.directory_entry.enabled {
@@ -701,6 +784,7 @@ impl Config {
         for spec in &self.mysql {
             valid_id(&spec.id)?;
             valid_id(&spec.package)?;
+            validate_directory_path(Path::new(&spec.name))?;
             ensure!(ids.insert(spec.id.to_lowercase()), "数据库实例标识重复");
             if !spec.series.is_empty() {
                 let path = spec.data_path(layout)?;

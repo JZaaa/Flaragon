@@ -19,6 +19,7 @@ pub const MAGIC: &[u8; 16] = b"FLARAGONPACK0001";
 const LIMIT: u64 = 512 * 1024 * 1024;
 const RELEASE: &str = "release.json";
 const REPAIR_BASE: &str = "repair-base.json";
+const UPDATE_BASE: &str = "update-base.json";
 const INSTALLATION: &str = ".flaragon-install.json";
 const ACTIVE: &str = ".maintenance/active.json";
 const OWNER: &str = ".maintenance/owner.json";
@@ -53,6 +54,7 @@ pub struct Package {
     pub manifest: Manifest,
     files: BTreeMap<String, Vec<u8>>,
     repair_base: Option<Manifest>,
+    update_base: Option<Manifest>,
 }
 
 fn version(value: &str) -> Result<[u16; 3]> {
@@ -199,7 +201,10 @@ impl Package {
                 .to_str()
                 .context("安装包路径编码无效")?
                 .to_owned();
-            if name != RELEASE && !(mode == Mode::Repair && name == REPAIR_BASE) {
+            if name != RELEASE
+                && !(mode == Mode::Repair && name == REPAIR_BASE)
+                && !(mode == Mode::Update && name == UPDATE_BASE)
+            {
                 program_file(&name)?;
             }
             ensure!(
@@ -226,6 +231,15 @@ impl Package {
         } else {
             None
         };
+        let update_base = files
+            .remove(UPDATE_BASE)
+            .map(|bytes| -> Result<Manifest> {
+                let base: Manifest = serde_json::from_slice(&bytes)?;
+                base.validate()?;
+                repair_allowed(&base, &manifest)?;
+                Ok(base)
+            })
+            .transpose()?;
         ensure!(
             files.len() == manifest.files.len() + 1,
             "安装包与发布清单不一致"
@@ -241,7 +255,21 @@ impl Package {
             manifest,
             files,
             repair_base,
+            update_base,
         })
+    }
+
+    fn update_allowed(&self, old: &Manifest) -> Result<()> {
+        if old.version == self.manifest.version {
+            ensure!(old != &self.manifest, "此安装已是该构建，无需重复更新");
+            ensure!(
+                self.update_base.as_ref() == Some(old),
+                "此安装不属于覆盖升级包指定的原始构建"
+            );
+            repair_allowed(old, &self.manifest)
+        } else {
+            upgrade_allowed(old, &self.manifest)
+        }
     }
 }
 
@@ -259,6 +287,7 @@ fn inside(path: &Path, base: &Path) -> bool {
 pub fn target_root(value: &Path) -> Result<PathBuf> {
     ensure!(value.is_absolute(), "请选择完整的本机安装目录");
     let mut root = local_path(value, value)?;
+    crate::config::validate_directory_path(&root)?;
     if let Some(boundary) = std::env::var_os("FLARAGON_DEV_ROOT") {
         let boundary = PathBuf::from(boundary);
         ensure!(
@@ -506,7 +535,9 @@ impl Journal {
         self.next.validate()?;
         if let Some(old) = &self.previous {
             old.validate()?;
-            if self.mode == Mode::Repair {
+            if self.mode == Mode::Repair
+                || (self.mode == Mode::Update && old.version == self.next.version)
+            {
                 repair_allowed(old, &self.next)?;
             } else {
                 upgrade_allowed(old, &self.next)?;
@@ -547,6 +578,9 @@ fn pending(root: &Path, package: &Package) -> Result<Option<Journal>> {
             package.repair_base.is_some() && journal.previous == package.repair_base,
             "未完成修复与此包的适用安装不符"
         );
+    }
+    if package.mode == Mode::Update {
+        package.update_allowed(journal.previous.as_ref().context("更新记录缺少原始安装")?)?;
     }
     ensure!(
         journal.next == package.manifest && journal.mode == package.mode,
@@ -673,7 +707,11 @@ impl Review {
             } else if package.mode == Mode::Repair {
                 "已确认此安装适用修复包；修复后产品版本号保持不变。"
             } else if package.mode == Mode::Update {
-                "已确认 Flaragon 安装身份与程序文件。"
+                if current == package.manifest.version {
+                    "已确认原始构建，允许同版本覆盖升级；产品版本号保持不变。"
+                } else {
+                    "已确认 Flaragon 安装身份与程序文件。"
+                }
             } else {
                 "目录检查通过，可以安装。"
             }
@@ -721,7 +759,7 @@ fn inspect_with(
                 );
                 repair_allowed(&old, &package.manifest)?;
             } else {
-                upgrade_allowed(&old, &package.manifest)?;
+                package.update_allowed(&old)?;
             }
             for name in package.manifest.files.keys() {
                 ensure!(

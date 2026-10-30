@@ -16,30 +16,33 @@ struct Managed {
     template: Option<String>,
 }
 
-pub fn needs_template(layout: &Layout, id: &str) -> Result<bool> {
-    let file = path(layout, id)?;
-    if !file.exists() {
+pub fn needs_template(layout: &Layout, file: &Path) -> Result<bool> {
+    let file = layout.path(file)?;
+    if !file.exists() || !layout.path(metadata(&file))?.exists() {
         return Ok(true);
     }
     let managed: Managed = serde_json::from_slice(&fs::read(layout.path(metadata(&file))?)?)?;
     Ok(managed.template.is_none())
 }
 
-pub fn path(layout: &Layout, id: &str) -> Result<PathBuf> {
-    let relative = if id == "apache" {
-        "apache/httpd.conf".to_owned()
-    } else if id == "redis" {
-        "redis/redis.conf".to_owned()
-    } else if let Some(id) = id.strip_prefix("php:") {
-        valid_id(id)?;
-        format!("php/{id}/php.ini")
-    } else if let Some(id) = id.strip_prefix("mysql:") {
-        valid_id(id)?;
-        format!("mysql/{id}/my.ini")
-    } else {
-        crate::bail!("未知服务");
+/// Resolve the native file within the selected, already discovered component package.
+pub fn package_path(layout: &Layout, package: &Package, id: &str) -> Result<PathBuf> {
+    let name = match package.kind {
+        Kind::Php => "php.ini".to_owned(),
+        Kind::Redis => "redis.conf".to_owned(),
+        Kind::Mysql => {
+            let instance = id.strip_prefix("mysql:").context("MySQL 实例标识无效")?;
+            valid_id(instance)?;
+            format!("instances/{instance}/my.ini")
+        }
+        Kind::Apache => return layout.path("config/services/apache/httpd.conf"),
     };
-    layout.path(format!("config/services/{relative}"))
+    let directory = layout.path(&package.directory)?;
+    ensure!(
+        directory.starts_with(layout.path(format!("bin/{}", package.kind.folder()))?),
+        "配置不属于所选组件包"
+    );
+    layout.path(directory.join(name))
 }
 
 fn metadata(path: &Path) -> PathBuf {
@@ -73,8 +76,8 @@ fn user_text(text: &str, managed: &Managed) -> Result<String> {
     Ok(body.to_owned())
 }
 
-pub fn read(layout: &Layout, id: &str) -> Result<String> {
-    let file = path(layout, id)?;
+pub fn read(layout: &Layout, file: &Path) -> Result<String> {
+    let file = layout.path(file)?;
     ensure!(
         fs::metadata(&file)?.len() <= MAX_CONFIG_BYTES as u64,
         "配置文件超过 1 MiB"
@@ -82,9 +85,9 @@ pub fn read(layout: &Layout, id: &str) -> Result<String> {
     fs::read_to_string(file).context("配置文件必须使用 UTF-8 编码")
 }
 
-pub fn validate_edit(layout: &Layout, id: &str, kind: Kind, text: &str) -> Result<()> {
+pub fn validate_edit(layout: &Layout, file: &Path, kind: Kind, text: &str) -> Result<()> {
     ensure!(text.len() <= MAX_CONFIG_BYTES, "配置文件超过 1 MiB");
-    let file = path(layout, id)?;
+    let file = layout.path(file)?;
     let managed: Managed = serde_json::from_slice(&fs::read(layout.path(metadata(&file))?)?)?;
     validate_user(layout, kind, &user_text(text, &managed)?)
 }
@@ -104,8 +107,8 @@ pub(crate) fn validate_relocated(
     )
 }
 
-pub fn replace_user(layout: &Layout, id: &str, text: &str) -> Result<String> {
-    let file = path(layout, id)?;
+pub fn replace_user(layout: &Layout, file: &Path, text: &str) -> Result<String> {
+    let file = layout.path(file)?;
     let managed: Managed = serde_json::from_slice(&fs::read(layout.path(metadata(&file))?)?)?;
     Ok(format!(
         "{}{}\n{}",
@@ -119,7 +122,7 @@ pub fn replace_user(layout: &Layout, id: &str, text: &str) -> Result<String> {
 #[allow(clippy::too_many_arguments)] // Each native template has independent managed sections and a one-time user seed.
 pub fn prepare(
     layout: &Layout,
-    id: &str,
+    file: &Path,
     kind: Kind,
     head: &str,
     tail: &str,
@@ -127,12 +130,12 @@ pub fn prepare(
     candidate: &Path,
     template: Option<&crate::config_template::Template>,
 ) -> Result<PathBuf> {
-    let file = path(layout, id)?;
+    let file = layout.path(file)?;
     let mut source = None;
-    let body = if file.exists() {
+    let body = if file.exists() && layout.path(metadata(&file))?.exists() {
         let managed: Managed = serde_json::from_slice(&fs::read(layout.path(metadata(&file))?)?)?;
         source = managed.template.clone();
-        let mut body = user_text(&read(layout, id)?, &managed)?;
+        let mut body = user_text(&read(layout, &file)?, &managed)?;
         let editable = managed
             .head
             .lines()
@@ -155,6 +158,22 @@ pub fn prepare(
     } else {
         normalize(seed)
     };
+    let native_template = if file.exists() && !layout.path(metadata(&file))?.exists() {
+        ensure!(
+            !read(layout, &file)?.contains("BEGIN FLARAGON"),
+            "配置管理基线缺失，请恢复配套基线后重试"
+        );
+        Some(crate::config_template::from_file(
+            layout,
+            &file,
+            file.parent().context("配置目录缺失")?,
+            kind,
+            head,
+        )?)
+    } else {
+        None
+    };
+    let template = native_template.as_ref().or(template);
     let body = if source.is_none() {
         if let Some(template) = template {
             source = Some(template.source.clone());
@@ -196,8 +215,8 @@ pub fn prepare(
     Ok(candidate)
 }
 
-pub fn commit(layout: &Layout, id: &str, candidate: &Path) -> Result<PathBuf> {
-    let file = path(layout, id)?;
+pub fn commit(layout: &Layout, file: &Path, kind: Kind, candidate: &Path) -> Result<PathBuf> {
+    let file = layout.path(file)?;
     fs::create_dir_all(layout.path(file.parent().context("配置目录缺失")?)?)?;
     let candidate_bytes = fs::read(layout.path(candidate)?)?;
     let candidate_metadata = fs::read(layout.path(metadata(candidate))?)?;
@@ -208,7 +227,7 @@ pub fn commit(layout: &Layout, id: &str, candidate: &Path) -> Result<PathBuf> {
     };
     if old.as_ref() != Some(&candidate_bytes) {
         if let Some(bytes) = &old {
-            let backup = if id == "redis" {
+            let backup = if kind == Kind::Redis {
                 crate::platform::secrets::seal(bytes)?
             } else {
                 bytes.clone()
@@ -217,7 +236,8 @@ pub fn commit(layout: &Layout, id: &str, candidate: &Path) -> Result<PathBuf> {
         }
         atomic_write(&file, &candidate_bytes)?;
     }
-    if let Err(error) = atomic_write(&layout.path(metadata(&file))?, &candidate_metadata) {
+    if let Err(error) = atomic_write_if_changed(&layout.path(metadata(&file))?, &candidate_metadata)
+    {
         if let Some(bytes) = old {
             atomic_write(&file, &bytes).context("配置基线保存失败，原文件恢复失败")?;
         }
@@ -226,8 +246,8 @@ pub fn commit(layout: &Layout, id: &str, candidate: &Path) -> Result<PathBuf> {
     Ok(file)
 }
 
-pub fn snapshot(layout: &Layout, id: &str) -> Result<Vec<(PathBuf, Vec<u8>)>> {
-    let file = path(layout, id)?;
+pub fn snapshot(layout: &Layout, file: &Path) -> Result<Vec<(PathBuf, Vec<u8>)>> {
+    let file = layout.path(file)?;
     [file.clone(), layout.path(metadata(&file))?]
         .into_iter()
         .filter(|p| p.exists())

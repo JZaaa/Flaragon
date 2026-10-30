@@ -103,7 +103,7 @@ def main():
         results.append('Redis whitespace delimiters and unquoted trailing Unicode whitespace match native authentication')
         session.call('stop_all')
         # Only native active/candidate configuration may contain a password.
-        for folder in ['runtime/state', 'runtime/path-backups', 'logs', 'config/services']:
+        for folder in ['runtime/state', 'runtime/path-backups', 'logs', 'config/services', 'bin/redis']:
             root = web.checked(web.ROOT / folder)
             if not root.exists():
                 continue

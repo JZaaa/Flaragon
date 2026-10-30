@@ -64,7 +64,7 @@ def main():
     setup = check(ROOT / f'dist/{current}/Flaragon-Setup-{current}-x64.exe')
     update = check(ROOT / f'dist/{current}/Flaragon-Update-{current}-x64.exe')
     cli = check(ROOT / 'target/x86_64-pc-windows-msvc/release/flaragon-cli.exe')
-    a, b, fresh = (base / n for n in ['软件 A 中文 空格', '软件 B', '新安装'])
+    a, b, fresh = (base / n for n in ['software A space', 'software B', 'fresh install'])
     for folder in [a, b]:
         run(old_setup, '--apply', folder)
     run(setup, '--apply', fresh)

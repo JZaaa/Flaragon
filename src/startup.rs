@@ -180,7 +180,7 @@ mod tests {
 
     fn fixture() -> Layout {
         let layout = Layout::new(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
-            "testwork/startup-中文 路径-{}",
+            "testwork/startup-space path-{}",
             crate::platform::random_token().unwrap()
         )))
         .unwrap();
@@ -254,7 +254,7 @@ mod tests {
         assert!(!inspect(&other).unwrap().registered);
         let cmd = command(&layout).unwrap();
         assert_eq!(cmd, format!("\"{}\\Flaragon.exe\"", layout.root.display()));
-        assert!(cmd.contains("中文 路径"));
+        assert!(cmd.contains("space path"));
         let report = apply(&layout, Settings::default()).unwrap();
         assert!(!report.registered && !report.settings.start_common_services);
         assert!(crate::platform::startup::read("Flaragon test").is_err());

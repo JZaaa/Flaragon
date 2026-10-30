@@ -176,6 +176,36 @@ pub fn scan_cached(layout: &Layout, cache: &mut Cache) -> Result<Vec<Package>> {
     }
     Ok(packages)
 }
+/// Locate package directories without executing binaries during startup path recovery.
+pub(crate) fn configuration_directories(layout: &Layout) -> Result<Vec<(Kind, PathBuf)>> {
+    let mut directories = Vec::new();
+    for (kind, executable) in [
+        (Kind::Php, "php.exe"),
+        (Kind::Mysql, "mysqld.exe"),
+        (Kind::Redis, "redis-server.exe"),
+    ] {
+        for entry in fs::read_dir(layout.path(format!("bin/{}", kind.folder()))?)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let path = layout.path(entry.path())?;
+            if let Some(exe) = find_executable(layout, &path, executable, 0)? {
+                let directory = if kind == Kind::Mysql {
+                    exe.parent().and_then(Path::parent)
+                } else {
+                    exe.parent()
+                };
+                if let Some(directory) = directory {
+                    directories.push((kind, layout.path(directory)?));
+                }
+            }
+            crate::ensure!(directories.len() <= 128, "组件数量超过 128 个");
+        }
+    }
+    Ok(directories)
+}
+
 fn find_executable(
     layout: &Layout,
     dir: &Path,

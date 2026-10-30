@@ -1,7 +1,7 @@
 param([string]$Profile = 'release')
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot\env.ps1"
-$uiRoot = Join-Path $taskRoot ('testwork\relocation-ui 中文-' + [guid]::NewGuid().ToString('N'))
+$uiRoot = Join-Path $taskRoot ('testwork\relocation-ui space-' + [guid]::NewGuid().ToString('N'))
 $evidenceRoot = Join-Path $taskRoot 'testwork\evidence'
 $uiExe = Join-Path $taskRoot "target\x86_64-pc-windows-msvc\$Profile\Flaragon.exe"
 function Assert-LocalPath([string]$Path) {

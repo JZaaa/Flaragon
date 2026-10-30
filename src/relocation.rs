@@ -48,50 +48,55 @@ fn read_optional(layout: &Layout, name: impl AsRef<Path>) -> Result<Option<Vec<u
     Ok(Some(fs::read(path)?))
 }
 
-fn native_files(
-    layout: &Layout,
-    directory: &str,
-    depth: u8,
-    files: &mut Vec<PathBuf>,
-) -> Result<()> {
-    let path = layout.path(directory)?;
-    if !path.exists() {
-        return Ok(());
-    }
-    ensure!(depth <= 4, "配置目录层级过深");
-    for entry in fs::read_dir(path)? {
-        let path = layout.path(entry?.path())?;
-        if path.is_dir() {
-            native_files(
-                layout,
-                &layout.relative(&path)?.to_string_lossy(),
-                depth + 1,
-                files,
-            )?;
-        } else {
-            let relative = layout.relative(&path)?;
-            let active = if relative.starts_with("config/services") {
-                native_kind(&relative).is_some()
-            } else {
-                matches!(
-                    path.extension().and_then(|s| s.to_str()),
-                    Some("ini" | "conf")
-                ) && path
-                    .file_stem()
-                    .is_some_and(|s| valid_id(&s.to_string_lossy()).is_ok())
-            };
-            if !active {
-                continue;
+fn native_files(layout: &Layout) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    let mut add = |file: PathBuf| -> Result<()> {
+        let file = layout.path(file)?;
+        let baseline = layout.path(file.with_extension("managed.json"))?;
+        if file.is_file() && baseline.is_file() {
+            files.push(layout.relative(file)?);
+            files.push(layout.relative(baseline)?);
+        }
+        ensure!(files.len() <= 1024, "配置文件数量超过检查上限");
+        Ok(())
+    };
+    add(layout.path("config/services/apache/httpd.conf")?)?;
+    for (kind, directory) in crate::discovery::configuration_directories(layout)? {
+        match kind {
+            Kind::Php => add(directory.join("php.ini"))?,
+            Kind::Redis => add(directory.join("redis.conf"))?,
+            Kind::Mysql => {
+                let instances = layout.path(directory.join("instances"))?;
+                if instances.is_dir() {
+                    for entry in fs::read_dir(instances)? {
+                        let entry = entry?;
+                        if entry.file_type()?.is_dir()
+                            && valid_id(&entry.file_name().to_string_lossy()).is_ok()
+                        {
+                            add(layout.path(entry.path())?.join("my.ini"))?;
+                        }
+                    }
+                }
             }
-            files.push(relative);
-            ensure!(files.len() <= 1024, "配置文件数量超过检查上限");
+            Kind::Apache => {}
         }
     }
-    Ok(())
+    let apache_seed = layout.path("config/overrides/apache.conf")?;
+    if apache_seed.is_file() {
+        files.push(layout.relative(apache_seed)?);
+    }
+    Ok(files)
+}
+
+pub(crate) fn is_config_path(path: &Path) -> bool {
+    native_kind(path).is_some() || path == Path::new("config/overrides/apache.conf")
 }
 
 fn native_kind(path: &Path) -> Option<Kind> {
     let parts: Vec<_> = path.iter().map(|s| s.to_str()).collect::<Option<_>>()?;
+    if parts.iter().any(|p| *p == ".." || *p == ".") {
+        return None;
+    }
     match parts.as_slice() {
         [
             "config",
@@ -99,26 +104,30 @@ fn native_kind(path: &Path) -> Option<Kind> {
             "apache",
             "httpd.conf" | "httpd.managed.json",
         ] => Some(Kind::Apache),
-        [
-            "config",
-            "services",
-            "redis",
-            "redis.conf" | "redis.managed.json",
-        ] => Some(Kind::Redis),
-        [
-            "config",
-            "services",
-            "php",
-            id,
-            "php.ini" | "php.managed.json",
-        ] if valid_id(id).is_ok() => Some(Kind::Php),
-        [
-            "config",
-            "services",
-            "mysql",
-            id,
-            "my.ini" | "my.managed.json",
-        ] if valid_id(id).is_ok() => Some(Kind::Mysql),
+        ["bin", "php", package, rest @ ..]
+            if !package.is_empty()
+                && rest.len() <= 4
+                && matches!(rest.last(), Some(&"php.ini" | &"php.managed.json")) =>
+        {
+            Some(Kind::Php)
+        }
+        ["bin", "redis", package, rest @ ..]
+            if !package.is_empty()
+                && rest.len() <= 4
+                && matches!(rest.last(), Some(&"redis.conf" | &"redis.managed.json")) =>
+        {
+            Some(Kind::Redis)
+        }
+        ["bin", "mysql", package, rest @ ..]
+            if !package.is_empty()
+                && rest.len() >= 3
+                && rest.len() <= 5
+                && rest[rest.len() - 3] == "instances"
+                && valid_id(rest[rest.len() - 2]).is_ok()
+                && matches!(rest.last(), Some(&"my.ini" | &"my.managed.json")) =>
+        {
+            Some(Kind::Mysql)
+        }
         _ => None,
     }
 }
@@ -316,7 +325,8 @@ fn allowed(path: &Path) -> bool {
             || path == Path::new(STATE)
             || path == Path::new("runtime/state/startup-registration.json")
             || path.starts_with("config/services")
-            || path.starts_with("config/overrides"))
+            || path.starts_with("config/overrides")
+            || is_config_path(path))
 }
 
 fn restore(layout: &Layout, changes: &[Change]) -> Result<()> {
@@ -415,9 +425,7 @@ pub fn check(layout: &Layout) -> Result<Report> {
         restore(layout, &changes).context("未完成的路径更新无法恢复")?;
         fs::remove_file(layout.path(JOURNAL)?)?;
     }
-    let mut files = Vec::new();
-    native_files(layout, "config/services", 0, &mut files)?;
-    native_files(layout, "config/overrides", 0, &mut files)?;
+    let files = native_files(layout)?;
     let mut state: Option<serde_json::Value> = read_optional(layout, STATE)?
         .map(|bytes| serde_json::from_slice(&bytes))
         .transpose()
@@ -469,7 +477,7 @@ pub fn check(layout: &Layout) -> Result<Report> {
                 } else {
                     serde_json::to_vec_pretty(&value)?
                 }
-            } else if path.starts_with("config/services/redis")
+            } else if native_kind(path) == Some(Kind::Redis)
                 || path == Path::new("config/overrides/redis.conf")
             {
                 text.split_inclusive('\n')
@@ -489,8 +497,7 @@ pub fn check(layout: &Layout) -> Result<Report> {
             stage(layout, &mut changes, path, next)?;
         }
         for path in files.iter().filter(|p| {
-            p.starts_with("config/services")
-                && p.extension().is_some_and(|e| e == "ini" || e == "conf")
+            native_kind(p).is_some() && p.extension().is_some_and(|e| e == "ini" || e == "conf")
         }) {
             let kind = native_kind(path).context("未知实例配置目录")?;
             let candidate = |name: &Path| -> Result<Vec<u8>> {

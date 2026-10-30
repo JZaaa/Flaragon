@@ -80,13 +80,15 @@ echo json_encode(['php'=>PHP_VERSION, 'base'=>$request->getAttribute('base'), 'w
             p['directory_entry'].update(enabled=True, port=28274+i, directory='www', address='127.0.0.1')
             if web.EXTERNAL_SITES:
                 p['directory_entry']['directory'] = str(SITE_ROOT / 'www')
-            web.write(web.ROOT / 'config/overrides/php' / (p['package']+'.ini'), 'extension=php_intl.dll\nextension=php_mbstring.dll\n')
         c['projects'] = [dict(id='cake4', name='CakePHP 4', directory='www/cake4', document_root='webroot', php=packages['8.3.35'], enabled=True),
                          dict(id='cake5', name='CakePHP 5', directory='www/cake5', document_root='webroot', php=packages['8.5.11'], enabled=True)]
         if web.EXTERNAL_SITES:
             for project in c['projects']:
                 project['directory'] = str(SITE_ROOT / project['directory'])
         session.call('apply', config=c)
+        for p in c['php']:
+            native = session.call('read_config', id='php:' + p['package'])
+            session.call('save_config', id='php:' + p['package'], text=native['text'] + '\nextension=php_intl.dll\nextension=php_mbstring.dll\n')
         session.call('start', id='apache')
         for name, version in [('cake4','8.3.35'), ('cake5','8.5.11')]:
             ports = [28280, next(p['directory_entry']['port'] for p in c['php'] if p['package'] == packages[version])]

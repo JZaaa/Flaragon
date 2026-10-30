@@ -1,6 +1,6 @@
 import { CheckBox, LineEdit, ScrollView, AboutSlint } from "std-widgets.slint";
 
-export struct ServiceRow { id: string, name: string, subtitle: string, module: string, common: bool, state: string, ports: string, detail: string, running: bool, can-start: bool, can-stop: bool }
+export struct ServiceRow { id: string, name: string, subtitle: string, module: string, common: bool, state: string, ports: string, detail: string, running: bool, missing: bool, can-remove: bool, can-start: bool, can-stop: bool }
 export struct ProjectRow { name: string, domain: string, enabled: bool, shared: bool, visible: bool }
 export struct PhpSetting { name: string, id: string, port: string, workers: string, usage: int, locked: bool, directory-enabled: bool, directory-port: string, directory-root: string, directory-address: string }
 export struct MysqlSetting { id: string, name: string, package-index: int, port: string, usage: int, fresh: bool, locked: bool, hint: string, exists: bool, valid: bool, reuse-data: bool, can-adopt: bool, data-warning: bool }
@@ -153,6 +153,7 @@ export component MainWindow inherits Window {
     in property <int> project-count;
     in property <int> package-count;
     in property <[ServiceRow]> services;
+    in property <[ServiceRow]> missing-services;
     in-out property <bool> launch-at-login;
     in-out property <bool> start-common-services;
     in property <bool> saved-launch-at-login;
@@ -321,7 +322,7 @@ export component MainWindow inherits Window {
                                     Rectangle { width: ServiceColumns.actions;
                                         HorizontalLayout { height: 34px; y: (parent.height - self.height) / 2; spacing: 8px;
                                             Action { text: service.running ? "停止" : "启动"; width: 72px; enabled: !root.busy && (service.running ? service.can-stop : service.can-start); clicked => { root.action(service.running ? "stop" : "start", service.id); } }
-                                            Action { text: "配置"; width: 72px; enabled: !root.busy; clicked => { root.action("config", service.id); } }
+                                            Action { text: service.missing ? "移除" : "配置"; width: 72px; danger: service.missing; enabled: !root.busy && (!service.missing || service.can-remove); clicked => { root.action(service.missing ? "remove-missing" : "config", service.id); } }
                                         }
                                     }
                                 }
@@ -332,8 +333,9 @@ export component MainWindow inherits Window {
                                     MenuItem { title: "重启"; enabled: !root.busy && service.can-stop; activated => { root.action("restart", service.id); } }
                                     MenuItem { title: "重加载配置（Apache）"; enabled: !root.busy && service.id == "apache" && service.running; activated => { root.action("reload", service.id); } }
                                     MenuSeparator { }
-                                    MenuItem { title: "编辑配置"; enabled: !root.busy; activated => { root.action("config", service.id); } }
+                                    MenuItem { title: "编辑配置"; enabled: !root.busy && !service.missing; activated => { root.action("config", service.id); } }
                                     MenuItem { title: "查看日志"; enabled: !root.busy; activated => { root.action("log", service.id); } }
+                                    MenuItem { title: "移除缺失组件"; enabled: !root.busy && service.can-remove; activated => { root.action("remove-missing", service.id); } }
                                 } }
                             }
                             Rectangle { vertical-stretch: 1; }
@@ -408,6 +410,18 @@ export component MainWindow inherits Window {
             }
             if root.page == 2 : VerticalLayout { spacing: 12px;
                 ScrollView { VerticalLayout { spacing: 16px;
+                    if root.missing-services.length > 0 : Rectangle {
+                        background: #ffffff; border-radius: 10px; border-width: 1px; border-color: #e5eaf3;
+                        height: 96px + root.missing-services.length * 44px;
+                        VerticalLayout { padding: 20px; spacing: 10px;
+                            Heading { text: "缺失组件"; }
+                            Label { text: "手动移除服务记录，保留文件和数据；PHP 被项目引用时需先切换项目版本。"; font-size: 11px; }
+                            for service in root.missing-services : HorizontalLayout { height: 34px; spacing: 12px;
+                                Text { text: service.name; color: #bc3344; overflow: elide; vertical-alignment: center; horizontal-stretch: 1; }
+                                Action { text: "移除"; danger: true; width: 76px; enabled: !root.busy && service.can-remove; clicked => { root.action("remove-missing", service.id); } }
+                            }
+                        }
+                    }
                     Rectangle { background: #ffffff; border-radius: 10px; border-width: 1px; border-color: #e5eaf3; min-height: 196px;
                         VerticalLayout { padding: 20px; spacing: 10px;
                             HorizontalLayout { spacing: 12px;

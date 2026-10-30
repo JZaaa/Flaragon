@@ -32,7 +32,7 @@ def assert_native_process_paths():
     for record in state['records']:
         native = session.call('read_config', id=record['id'])
         assert ROOT / record['config'] == Path(native['path'])
-        assert Path(native['path']).resolve().is_relative_to(ROOT / 'config/services')
+        assert Path(native['path']).resolve().is_relative_to(ROOT / ('config/services/apache' if record['id'] == 'apache' else 'bin'))
 
 
 try:
@@ -43,7 +43,7 @@ try:
     for package in packages.values():
         directory = Path(package['directory']).resolve()
         assert directory.is_relative_to(ROOT)
-        for relative in ['php.ini', 'php.ini-development', 'php.ini-production', 'my.ini', 'redis.conf', 'conf/httpd.conf']:
+        for relative in ['php.ini-development', 'php.ini-production', 'my.ini', 'conf/httpd.conf']:
             file = directory / relative
             assert file.resolve().is_relative_to(ROOT)
             if file.is_file():
@@ -130,7 +130,7 @@ try:
         native = session.call('read_config', id='php:' + php['package'])['text']
         assert '; 保留中文注释' in native and 'precision=12' in native
     assert all(file.read_bytes() == original for file, original in package_files.items())
-    passed('Native comments and settings survive manager restart; installation-directory configuration bytes remain unchanged')
+    passed('Native comments and settings survive manager restart; source templates remain unchanged')
 finally:
     try:
         session.call('stop_all')

@@ -52,7 +52,7 @@ def main():
         return {name: checked(target / name).read_bytes()
                 for name in [*manifest['files'], 'release.json', '.flaragon-install.json']}
 
-    first, second, gui = [checked(base / name) for name in ['修复 中文 空格', 'independent', 'gui-target']]
+    first, second, gui = [checked(base / name) for name in ['repair space', 'independent', 'gui-target']]
     for target in [first, second, gui]:
         call(setup, '--apply', target)
         if baseline_repair:

@@ -19,7 +19,10 @@ fn layout() -> Layout {
 #[test]
 fn preserves_native_comments_sections_and_options_when_instance_settings_change() {
     let layout = layout();
-    let id = "mysql:separate";
+    let owned_file = layout
+        .path("bin/mysql/example/instances/separate/my.ini")
+        .unwrap();
+    let id = owned_file.as_path();
     let candidate = layout
         .path("runtime/generated/mysql.ini")
         .expect("candidate");
@@ -34,7 +37,7 @@ fn preserves_native_comments_sections_and_options_when_instance_settings_change(
         None,
     )
     .expect("prepare");
-    let file = native::commit(&layout, id, &candidate).expect("commit");
+    let file = native::commit(&layout, id, Kind::Mysql, &candidate).expect("commit");
     let text = native::read(&layout, id)
         .expect("read")
         .replace("connect_timeout=17", "# 保留注释\nconnect_timeout=23");
@@ -56,14 +59,16 @@ fn preserves_native_comments_sections_and_options_when_instance_settings_change(
         text,
         "preflight cannot replace the live file"
     );
-    native::commit(&layout, id, &candidate).expect("apply");
+    native::commit(&layout, id, Kind::Mysql, &candidate).expect("apply");
     let applied = native::read(&layout, id).expect("read applied");
     assert!(applied.contains("port=13309") && applied.contains("# 保留注释\nconnect_timeout=23"));
     assert!(applied.contains("[client]\ndefault-character-set=utf8mb4"));
     assert!(applied.contains("character-set-server=utf8mb4"));
     assert_ne!(
-        native::path(&layout, id).expect("path"),
-        native::path(&layout, "mysql:other").expect("other instance")
+        layout.path(id).unwrap(),
+        layout
+            .path("bin/mysql/example/instances/other/my.ini")
+            .unwrap()
     );
 }
 
@@ -73,7 +78,7 @@ fn rejects_managed_changes_and_external_references_before_component_execution() 
     let candidate = layout.path("runtime/generated/php.ini").expect("candidate");
     native::prepare(
         &layout,
-        "php:test",
+        &layout.path("bin/php/test/php.ini").unwrap(),
         Kind::Php,
         "[PHP]\nextension_dir=ext\n",
         "",
@@ -82,12 +87,18 @@ fn rejects_managed_changes_and_external_references_before_component_execution() 
         None,
     )
     .expect("prepare");
-    native::commit(&layout, "php:test", &candidate).expect("commit");
-    let text = native::read(&layout, "php:test").expect("read");
+    native::commit(
+        &layout,
+        &layout.path("bin/php/test/php.ini").unwrap(),
+        Kind::Php,
+        &candidate,
+    )
+    .expect("commit");
+    let text = native::read(&layout, &layout.path("bin/php/test/php.ini").unwrap()).expect("read");
     assert!(
         native::validate_edit(
             &layout,
-            "php:test",
+            &layout.path("bin/php/test/php.ini").unwrap(),
             Kind::Php,
             &text.replace("extension_dir=ext", "extension_dir=elsewhere")
         )
@@ -132,7 +143,8 @@ fn imports_package_template_once_and_keeps_existing_values_and_original_bytes() 
     let original = "; Native development template\n[PHP]\n; precision documentation\nprecision = 14\n; memory documentation\nmemory_limit = 128M\n;extension=pdo_mysql\n[Session]\nsession.cookie_path = /\n";
     fs::write(directory.join("php.ini-development"), original).expect("package template");
     let candidate = layout.path("runtime/generated/php.ini").expect("candidate");
-    let id = "php:example";
+    let owned_file = layout.path("bin/php/example/php.ini").unwrap();
+    let id = owned_file.as_path();
     native::prepare(
         &layout,
         id,
@@ -144,7 +156,7 @@ fn imports_package_template_once_and_keeps_existing_values_and_original_bytes() 
         None,
     )
     .expect("short existing config");
-    let file = native::commit(&layout, id, &candidate).expect("commit");
+    let file = native::commit(&layout, id, Kind::Php, &candidate).expect("commit");
     let before = fs::read(&file).expect("before");
     assert!(native::needs_template(&layout, id).expect("migration status"));
     let template = flaragon::config_template::load(&layout, &directory, Kind::Php, "[PHP]\n")
@@ -161,7 +173,7 @@ fn imports_package_template_once_and_keeps_existing_values_and_original_bytes() 
     )
     .expect("template upgrade");
     assert_eq!(fs::read(&file).expect("unchanged active file"), before);
-    native::commit(&layout, id, &candidate).expect("apply template");
+    native::commit(&layout, id, Kind::Php, &candidate).expect("apply template");
     let full = native::read(&layout, id).expect("full");
     assert!(full.contains("; precision documentation\n; 实例自定义值见下方\n; precision = 14"));
     assert!(full.contains("memory_limit = 128M") && full.contains(";extension=pdo_mysql"));
@@ -207,4 +219,106 @@ fn mysql_template_merge_preserves_group_scope_and_reports_missing_template() {
     );
     assert!(merged.contains("; connect_timeout=10\n[client]\nconnect_timeout=20"));
     assert!(merged.contains("[mysqld]\nconnect_timeout=17\n[client]"));
+}
+
+#[test]
+fn package_native_file_is_authoritative_and_replacement_does_not_restore_old_settings() {
+    let layout = layout();
+    let directory = layout.path("bin/php/example").unwrap();
+    let file = directory.join("php.ini");
+    let candidate = layout.path("runtime/generated/php.ini").unwrap();
+    fs::create_dir_all(&directory).unwrap();
+    fs::create_dir_all(layout.path("config/services/php/example").unwrap()).unwrap();
+    fs::create_dir_all(layout.path("config/overrides/php").unwrap()).unwrap();
+    atomic_write(
+        &file,
+        b"; package settings\n[PHP]\nprecision=11\nextension=curl\n",
+    )
+    .unwrap();
+    atomic_write(
+        &layout.path("config/services/php/example/php.ini").unwrap(),
+        b"extension=missing_old_extension\n",
+    )
+    .unwrap();
+    atomic_write(
+        &layout.path("config/overrides/php/example.ini").unwrap(),
+        b"extension=another_old_extension\n",
+    )
+    .unwrap();
+    for expected in ["11", "13"] {
+        let template =
+            flaragon::config_template::load(&layout, &directory, Kind::Php, "[PHP]\n").unwrap();
+        native::prepare(
+            &layout,
+            &file,
+            Kind::Php,
+            "[PHP]\n",
+            "",
+            "",
+            &candidate,
+            Some(&template),
+        )
+        .unwrap();
+        native::commit(&layout, &file, Kind::Php, &candidate).unwrap();
+        let text = native::read(&layout, &file).unwrap();
+        assert!(text.contains(&format!("precision={expected}")));
+        assert!(!text.contains("old_extension"));
+        let modified = fs::metadata(&file).unwrap().modified().unwrap();
+        let baseline = file.with_extension("managed.json");
+        let baseline_modified = fs::metadata(&baseline).unwrap().modified().unwrap();
+        native::prepare(
+            &layout,
+            &file,
+            Kind::Php,
+            "[PHP]\n",
+            "",
+            "",
+            &candidate,
+            Some(&template),
+        )
+        .unwrap();
+        native::commit(&layout, &file, Kind::Php, &candidate).unwrap();
+        assert_eq!(fs::metadata(&file).unwrap().modified().unwrap(), modified);
+        assert_eq!(
+            fs::metadata(&baseline).unwrap().modified().unwrap(),
+            baseline_modified
+        );
+        if expected == "11" {
+            fs::remove_file(&file).unwrap();
+            fs::remove_file(baseline).unwrap();
+            atomic_write(&file, b"; fresh package\n[PHP]\nprecision=13\n").unwrap();
+        }
+    }
+    assert!(
+        !native::read(&layout, &file)
+            .unwrap()
+            .contains("extension=curl")
+    );
+}
+
+#[test]
+fn native_paths_follow_nested_packages_and_mysql_instances_stay_separate() {
+    let layout = layout();
+    let mut package = Package {
+        id: "fixture".into(),
+        name: "fixture".into(),
+        kind: Kind::Php,
+        directory: layout.path("bin/php/fixture/nested").unwrap(),
+        executable: layout.path("bin/php/fixture/nested/php.exe").unwrap(),
+        version: "8.5.11".into(),
+        architecture: "x64".into(),
+        php_thread_safe: Some(false),
+        error: None,
+    };
+    assert_eq!(
+        native::package_path(&layout, &package, "php:fixture").unwrap(),
+        package.directory.join("php.ini")
+    );
+    package.kind = Kind::Mysql;
+    package.directory = layout.path("bin/mysql/fixture/nested").unwrap();
+    let a = native::package_path(&layout, &package, "mysql:a").unwrap();
+    let b = native::package_path(&layout, &package, "mysql:b").unwrap();
+    assert_ne!(a, b);
+    assert!(a.starts_with(&package.directory) && b.starts_with(&package.directory));
+    assert!(native::package_path(&layout, &package, "mysql:../outside").is_err());
 }

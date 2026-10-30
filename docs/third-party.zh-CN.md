@@ -15,7 +15,7 @@ redis-windows 仓库标注的 Apache-2.0 是其仓库代码许可，不能据此
 
 `bin` 内保存原始发行包文件；组件与业务数据分离，不把这些二进制合并进管理器。下载脚本固定已验证版本，下载成功不等于其他版本或其他机器已经通过兼容性测试。
 
-实例配置的模板在运行时读取用户放入的组件包，来源包括 PHP 的 php.ini-development、Apache Lounge 的 conf/httpd.conf 和 redis-windows 的 redis.conf，适用各发行包许可。配置副本保留原始注释并注明包内来源；管理器不内嵌第三方模板文本。
+实例配置的模板在运行时读取用户放入的组件包，来源包括 PHP 的 php.ini-development、Apache Lounge 的 conf/httpd.conf 和 redis-windows 的 redis.conf，适用各发行包许可。正式配置保留模板注释并注明包内来源；管理器不内嵌第三方模板文本。
 
 ## Rust 依赖与工具链
 

@@ -1,4 +1,4 @@
-param([switch]$SkipBuild, [string]$BuildId)
+param([switch]$SkipBuild, [string]$BuildId, [string]$SameVersionBase)
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot\env.ps1"
 & "$taskRoot\.tools\python\python.exe" "$PSScriptRoot\test-release-policy.py"
@@ -10,5 +10,6 @@ if (-not $SkipBuild) {
 if ($LASTEXITCODE -ne 0) { throw '许可文件收集失败' }
 $taskPackageArgs = @()
 if ($BuildId) { $taskPackageArgs += @('--build-id', $BuildId) }
+if ($SameVersionBase) { $taskPackageArgs += @('--same-version-base', $SameVersionBase) }
 & "$taskRoot\.tools\python\python.exe" "$PSScriptRoot\package.py" @taskPackageArgs
 if ($LASTEXITCODE -ne 0) { throw '发布包生成失败' }

@@ -105,7 +105,7 @@ def main():
         config["redis"].update(port=16379, usage="common")
         for index, php in enumerate(config["php"]):
             php["port"] = 19100 + index * 8
-            directory = ROOT / "www" / f"验收 项目 {index}"
+            directory = ROOT / "www" / f"acceptance site {index}"
             public = directory / "public"
             public.mkdir(parents=True, exist_ok=True)
             (directory / "alternate").mkdir(exist_ok=True)
@@ -134,7 +134,7 @@ echo json_encode(['version'=>PHP_VERSION, 'memory'=>ini_get('memory_limit'), 'ro
             assert json.loads(http(domain, "/index.php/path/info"))["path"] == "/path/info"
             body = '--FlaragonBoundary\r\nContent-Disposition: form-data; name="file"; filename="sample.txt"\r\nContent-Type: text/plain\r\n\r\nupload-ok\r\n--FlaragonBoundary--\r\n'
             assert json.loads(http(domain, "/", "POST", body, {"Content-Type": "multipart/form-data; boundary=FlaragonBoundary"}))["upload"] == "upload-ok"
-            record(f"PHP {info['version']}: Chinese/spaced public root, static, Rewrite, PATH_INFO, upload")
+            record(f"PHP {info['version']}: spaced public root, static, Rewrite, PATH_INFO, upload")
         with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
             versions = list(pool.map(lambda i: json.loads(http(f"accept{i%3}.localhost"))["version"], range(60)))
         assert len(versions) == 60

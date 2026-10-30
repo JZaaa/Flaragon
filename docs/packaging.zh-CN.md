@@ -11,7 +11,7 @@
 
 `scripts/package.ps1` 会自动加载 `scripts/env.ps1`，将缓存、编译输出和临时目录定向到项目内，不需要手动配置系统 PATH。
 
-从 0.0.4 起，发布脚本从 CHANGELOG 的正式版本标题（`# x.y.z`，不含“未发布”标记）选择小于目标版本的最大版本，写入清单 `minimum_version`；运行时将其作为唯一允许的来源版本。缺少上一正式版本时拒绝组包，不用版本号减一推算，也不依赖本机是否保留对应 `dist` 目录。`release-policy.json` 的 `minimum_version` 仅用于 0.0.3 及更早版本，`excluded_versions` 和 `remove` 继续生效。规则检查由 `scripts/test-release-policy.py` 执行，打包入口会先运行该检查。
+从 0.0.4 起，发布脚本从 CHANGELOG 的正式版本标题（`# x.y.z`，不含“未发布”标记）选择小于目标版本的最大版本，写入清单 `minimum_version`；运行时将其作为唯一允许的跨版本来源。缺少上一正式版本时拒绝组包，不用版本号减一推算，也不依赖本机是否保留对应 `dist` 目录。`release-policy.json` 的 `minimum_version` 仅用于 0.0.3 及更早版本，`excluded_versions` 和 `remove` 继续生效。规则检查由 `scripts/test-release-policy.py` 执行，打包入口会先运行该检查。
 
 ## 完整打包
 
@@ -31,38 +31,34 @@
 
 `-SkipBuild` 仍执行许可收集、自检和组包，不能用来跳过失败的检查或发布旧构建。
 
-生成后，执行真实 EXE 安装与升级验收。以下为 0.0.3 归档对应的验收命令：
+生成后，执行真实 EXE 安装与升级验收。0.0.4 使用以下命令：
 
 ```powershell
 . .\scripts\env.ps1
-& .\.tools\python\python.exe .\scripts\acceptance-release.py --baseline 0.0.1 --repair .\dist\repairs\php-version-0.0.1\update.exe
-& .\.tools\python\python.exe .\scripts\acceptance-release.py --baseline 0.0.2 --repair .\dist\repairs\latest-dev-0.0.2\update.exe
-& .\.tools\python\python.exe .\scripts\acceptance-release.py --baseline 0.0.2 --repair .\dist\repairs\redis-refresh-0.0.2\update.exe
-& .\.tools\python\python.exe .\scripts\acceptance-release.py --baseline 0.0.2 --repair .\dist\repairs\redis-refresh-0.0.2\update.exe --repair .\dist\repairs\latest-dev-from-redis-refresh-0.0.2\update.exe
-& .\.tools\python\python.exe .\scripts\acceptance-release.py --baseline 0.0.2 --baseline-release .\dist\rebuilds\latest-dev-0.0.2
+& .\.tools\python\python.exe .\scripts\acceptance-release.py --baseline 0.0.3 --rejected-baseline 0.0.2 --rejected-baseline 0.0.1
 ```
 
 该脚本仅在项目的 `testwork` 中新建独立安装目录，检查安装载荷、版本自检、原始及已修复安装升级、用户文件与修改时间保留、运行占用拒绝、多环境隔离及中断续修，不启动组件服务。结果按目标归档、基线归档及最后应用的补丁标识分别保存在 `testwork/evidence/release-*.json`，不替代 GUI、真实组件或跨机器验证。`--baseline` 指定已归档的低版本；`--repair` 可重复指定，按顺序应用对应基线修复包；`--baseline-release` 指定独立重打包归档。
 
-从 0.0.4 起，`--baseline` 必须指定上一正式版本，使用 `--rejected-baseline` 指定应拒绝的更旧版本；该参数可重复，验证检查和执行阶段均拒绝跳版且不替换文件。例如用户明确发布 0.0.4 并完成组包后，运行 `scripts/acceptance-release.py --baseline 0.0.3 --rejected-baseline 0.0.2`。此示例不表示已有 0.0.4 发布包。
+从 0.0.4 起，跨版本验收的 `--baseline` 必须指定上一正式版本；同版本验收须另外通过 `--baseline-release` 明确指定原始归档，使用 `--rejected-baseline` 指定应拒绝的更旧版本；该参数可重复，验证检查和执行阶段均拒绝跳版且不替换文件。
 
 ## 输出与命名
 
-输出目录为项目内的 `dist/<版本>/`。0.0.3 的产物如下：
+输出目录为项目内的 `dist/<版本>/`。0.0.4 的产物如下：
 
 | 文件 | 用途 |
 | --- | --- |
-| `dist/0.0.3/Flaragon-Setup-0.0.3-x64.exe` | 新环境安装包 |
-| `dist/0.0.3/Flaragon-Update-0.0.3-x64.exe` | 已有正式安装的升级包 |
-| `dist/0.0.3/payload/` | 组包载荷，含 Flaragon.exe、编辑器 DLL、许可和发布清单 |
-| `dist/0.0.3/release.json` | 发布版本、架构、兼容范围及文件清单 |
-| `dist/0.0.3/build-info.json` | 构建来源、包内容和签名状态说明 |
+| `dist/0.0.4/Flaragon-Setup-0.0.4-x64.exe` | 新环境安装包 |
+| `dist/0.0.4/Flaragon-Update-0.0.4-x64.exe` | 0.0.3 升级及指定原始 0.0.4 构建覆盖升级 |
+| `dist/0.0.4/payload/` | 组包载荷，含 Flaragon.exe、编辑器 DLL、许可和发布清单 |
+| `dist/0.0.4/release.json` | 发布版本、架构、兼容范围及文件清单 |
+| `dist/0.0.4/build-info.json` | 构建来源、包内容和签名状态说明 |
 
 通用命名为 `Flaragon-Setup-<版本>-x64.exe` 和 `Flaragon-Update-<版本>-x64.exe`。对外提供安装 EXE 即可，不需要附带源码、Rust 或打包脚本。
 
 0.0.1 归档仅包含 Setup，不提供该版本的 Update；从 0.0.1 升级时使用目标版本的 Update。
 
-新环境使用 Setup 包；已有 0.0.1、0.0.2 正式安装使用 Update 包，兼容范围包括对应的已归档补丁及独立重打包构建，最低兼容版本为 0.0.1。升级前在目标环境“停止并退出”，再运行 Update，选择安装目录，点击“检查目录 → 开始升级”。同版本、降级和无安装清单目录拒绝；实际验收范围以对应发布验证证据为准。
+新环境使用 Setup 包；0.0.4 Update 接受 0.0.3 正式安装及明确绑定的原始 0.0.4 构建，0.0.1 和 0.0.2 安装须先使用归档的 0.0.3 Update 升级至 0.0.3。升级前在目标环境“停止并退出”，再运行 Update，选择安装目录，点击“检查目录 → 开始升级”。跳版、重复或不匹配的同版本构建、降级和无安装清单目录拒绝；实际验收范围以对应发布验证证据为准。
 
 ## 产物范围与检查
 
@@ -107,6 +103,19 @@
 真实 EXE 验收命令：加载 `scripts/env.ps1` 后，运行 `.\.tools\python\python.exe .\scripts\acceptance-repair.py --repair .\dist\repairs\redis-refresh-0.0.2`；只操作项目内的新建安装夹具。其他修复包通过 `--repair` 指定对应目录。
 
 ## 用户指定的同版本重打包
+
+用户授权替换 0.0.4 正式入口时，先保留原始归档 `dist/archives/original-0.0.4`，再生成独立候选包。以下命令适用于尚未存在的候选目录：
+
+```powershell
+.\scripts\package.ps1 -BuildId missing-components-0.0.4 -SameVersionBase .\dist\archives\original-0.0.4
+. .\scripts\env.ps1
+& .\.tools\python\python.exe .\scripts\acceptance-release.py --baseline 0.0.4 --baseline-release .\dist\archives\original-0.0.4 --release .\dist\rebuilds\missing-components-0.0.4
+& .\.tools\python\python.exe .\scripts\acceptance-release.py --baseline 0.0.3 --release .\dist\rebuilds\missing-components-0.0.4 --rejected-baseline 0.0.2 --rejected-baseline 0.0.1
+```
+
+`-SameVersionBase` 仅配合独立构建标识使用；新 Update 携带原始完整清单作为 update-base.json，Setup 不携带此绑定。保持程序文件集合和配套依赖，使用新的 release_id。候选通过安装、两种升级来源、拒绝场景及中断续修验证后，才可按用户授权将候选内容复制到 `dist/0.0.4` 正式入口。原始归档保留，不删除归档以绕过内容保护；普通打包命令不会覆盖不同内容的既有归档。
+
+未要求替换正式入口、未指定同版本绑定时，按以下独立重打包规则处理。
 
 只有用户明确指定同版本重打包时才使用 `-BuildId`，标识须以产品版本结尾。以下命令示例对应独立归档；该目录已存在时不能重复生成或覆盖，应使用新的唯一构建标识。
 

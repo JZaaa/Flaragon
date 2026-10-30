@@ -79,10 +79,10 @@ def main():
         config['redis'].update(port=26379, usage='common')
         config['mysql'] = [dict(id='5-7-demo', name='demo', series='5.7', package=by_version['5.7.44']['id'], port=23357, usage='common', reuse_data=False),
                            dict(id='8-0-demo', name='demo', series='8.0', package=by_version['8.0.44']['id'], port=23380, usage='normal', reuse_data=False)]
-        site = checked(ROOT / 'www/中文 测试/public')
+        site = checked(ROOT / 'www/site space/public')
         site.mkdir(parents=True)
         (site / 'index.php').write_text('<?php echo PHP_VERSION;', encoding='utf-8')
-        config['projects'] = [dict(id='site', domain='site.localhost', directory='www/中文 测试', document_root='public', php=None, enabled=True)]
+        config['projects'] = [dict(id='site', domain='site.localhost', directory='www/site space', document_root='public', php=None, enabled=True)]
         session.call('apply', config=config)
         session.call('start_common')
         common_ids = session.identities()

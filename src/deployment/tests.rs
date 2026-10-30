@@ -2,7 +2,7 @@ use super::*;
 
 fn fixture() -> PathBuf {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
-        "testwork/deployment-中文 空格-{}",
+        "testwork/deployment-space path-{}",
         platform::random_token().unwrap()
     ));
     assert!(std::env::var_os("FLARAGON_DEV_ROOT").is_some());
@@ -44,6 +44,7 @@ fn package(ver: &str, mode: Mode) -> Package {
         manifest,
         files,
         repair_base: None,
+        update_base: None,
     }
 }
 
@@ -104,6 +105,62 @@ fn repair_package() -> Package {
         serde_json::to_vec(&repair.manifest).unwrap(),
     );
     repair
+}
+
+fn overwrite_package() -> Package {
+    let mut p = repair_package();
+    p.mode = Mode::Update;
+    p.update_base = p.repair_base.take();
+    p
+}
+
+#[test]
+fn bound_same_version_update_rejects_other_builds_and_repeat_without_writes() {
+    let root = fixture();
+    first(&root);
+    let before = read_program(&root);
+    let mut wrong = overwrite_package();
+    wrong.update_base.as_mut().unwrap().release_id = "a".repeat(32);
+    assert!(run(&wrong, &root, pass, None).is_err());
+    wrong.update_base = None;
+    assert!(run(&wrong, &root, pass, None).is_err());
+    assert_eq!(before, read_program(&root));
+    assert!(!root.join(ACTIVE).exists());
+    let next = overwrite_package();
+    let identity = installation(&root).unwrap();
+    assert!(
+        inspect_with(&next, &root, pass)
+            .unwrap()
+            .description(&next)
+            .contains("同版本覆盖升级")
+    );
+    run(&next, &root, pass, None).unwrap();
+    assert_eq!(installation(&root).unwrap(), identity);
+    let after = read_program(&root);
+    assert!(run(&next, &root, pass, None).is_err());
+    assert!(run(&package("0.2.0", Mode::Update), &root, pass, None).is_err());
+    assert_eq!(after, read_program(&root));
+}
+
+#[test]
+fn interrupted_bound_update_requires_exact_base_and_payload() {
+    let root = fixture();
+    first(&root);
+    let next = overwrite_package();
+    assert!(run(&next, &root, pass, Some(1)).is_err());
+    assert!(ensure_ready(&root).is_err());
+    let mut wrong = overwrite_package();
+    wrong.update_base = None;
+    assert!(run(&wrong, &root, pass, None).is_err());
+    wrong.update_base = next.update_base.clone();
+    wrong.update_base.as_mut().unwrap().release_id = "a".repeat(32);
+    assert!(run(&wrong, &root, pass, None).is_err());
+    wrong.update_base = next.update_base.clone();
+    wrong.files.get_mut("Flaragon.exe").unwrap()[0] = b'X';
+    assert!(run(&wrong, &root, pass, None).is_err());
+    run(&next, &root, pass, None).unwrap();
+    assert_eq!(installed(&root).unwrap(), next.manifest);
+    assert!(ensure_ready(&root).is_ok());
 }
 
 #[test]
@@ -174,6 +231,16 @@ fn repair_archive_requires_baseline_and_does_not_enable_regular_same_version_upd
     assert_eq!(parsed.repair_base, repair.repair_base);
     assert!(!parsed.files.contains_key(REPAIR_BASE));
     assert!(Package::from_archive(Mode::Update, &encode(&files)).is_err());
+    files.remove(REPAIR_BASE);
+    files.insert(
+        UPDATE_BASE.into(),
+        serde_json::to_vec(repair.repair_base.as_ref().unwrap()).unwrap(),
+    );
+    let parsed = Package::from_archive(Mode::Update, &encode(&files)).unwrap();
+    assert_eq!(parsed.update_base, repair.repair_base);
+    assert!(!parsed.files.contains_key(UPDATE_BASE));
+    assert!(Package::from_archive(Mode::Install, &encode(&files)).is_err());
+    assert!(Package::from_archive(Mode::Repair, &encode(&files)).is_err());
     let mut changed = repair.manifest.clone();
     changed.version = "0.3.0".into();
     assert!(repair_allowed(repair.repair_base.as_ref().unwrap(), &changed).is_err());

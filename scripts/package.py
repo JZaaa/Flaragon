@@ -86,6 +86,7 @@ def write_package(stub, payload, destination, mode):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--build-id', help='Explicitly requested same-version rebuild in a separate archive')
+    parser.add_argument('--same-version-base', type=Path, help='Explicit original archive accepted by the rebuilt Update')
     args = parser.parse_args()
     if os.environ.get('FLARAGON_DEV_ROOT', '').lower() != str(ROOT).lower():
         raise ValueError('Run scripts/env.ps1 first')
@@ -101,8 +102,24 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     manifest_path = checked(output / 'release.json')
     previous = json.loads(manifest_path.read_text(encoding='utf-8')) if manifest_path.exists() else None
+    if previous and checked(output / 'update-base.json').exists():
+        raise ValueError('Bound update archive is fixed; create a separate build with an explicit baseline')
     release_id = previous['release_id'] if previous else uuid.uuid4().hex
     manifest, files = build_payload(version, release_id)
+    update_base = None
+    if args.same_version_base:
+        if not args.build_id:
+            raise ValueError('Bound same-version update requires a separate build archive')
+        base_dir = checked(args.same_version_base.absolute())
+        update_base = json.loads(checked(base_dir / 'release.json').read_bytes())
+        for key in ('product', 'version', 'architecture', 'format', 'config_schema', 'minimum_version', 'excluded_versions'):
+            if update_base[key] != manifest[key]:
+                raise ValueError(f'Same-version baseline mismatch: {key}')
+        if update_base['release_id'] == release_id or manifest['remove'] or update_base['files'].keys() != manifest['files'].keys():
+            raise ValueError('Same-version update requires a new identity and identical program file set')
+        for name in manifest['files']:
+            if name != 'Flaragon.exe' and checked(base_dir / 'payload' / name).read_bytes() != files[name]:
+                raise ValueError(f'Same-version update must preserve bundled dependencies: {name}')
     stage = checked(output / 'payload')
     if stage.exists():
         existing = {p.relative_to(stage).as_posix() for p in stage.rglob('*') if checked(p).is_file()}
@@ -120,7 +137,12 @@ def main():
     payload = archive(files)
     for mode, kind in enumerate(('Setup', 'Update')):
         path = checked(output / f'Flaragon-{kind}-{version}-x64.exe')
-        write_package(stub, payload, path, mode)
+        packed = payload
+        if mode == 1 and update_base:
+            base_bytes = json.dumps(update_base, ensure_ascii=False, indent=2).encode('utf-8')
+            checked(output / 'update-base.json').write_bytes(base_bytes)
+            packed = archive({**files, 'update-base.json': base_bytes})
+        write_package(stub, packed, path, mode)
         print(path)
     checked(output / 'release.json').write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
     checked(output / 'build-info.json').write_text(json.dumps({
@@ -129,6 +151,7 @@ def main():
         'executable_bytes': len(files['Flaragon.exe']),
         'build_id': args.build_id,
         'release_id': release_id,
+        'same_version_base': update_base['release_id'] if update_base else None,
     }, indent=2) + '\n', encoding='utf-8')
 
 

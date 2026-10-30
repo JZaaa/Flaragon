@@ -18,6 +18,14 @@ fn old_root(layout: &Layout) -> PathBuf {
 }
 
 fn seed(layout: &Layout, old: &Path) {
+    fs::create_dir_all(layout.path("bin/php/fixture").unwrap()).unwrap();
+    fs::create_dir_all(layout.path("bin/redis/fixture").unwrap()).unwrap();
+    atomic_write(&layout.path("bin/php/fixture/php.exe").unwrap(), b"fixture").unwrap();
+    atomic_write(
+        &layout.path("bin/redis/fixture/redis-server.exe").unwrap(),
+        b"fixture",
+    )
+    .unwrap();
     let mut config = Config::default();
     config.php.push(PhpSpec {
         package: "php-fixture".into(),
@@ -25,7 +33,7 @@ fn seed(layout: &Layout, old: &Path) {
         workers: 1,
         usage: ServiceUsage::Normal,
         directory_entry: DirectoryEntry {
-            directory: old.join("www/中文 网站"),
+            directory: old.join("www/site space"),
             ..DirectoryEntry::default()
         },
     });
@@ -42,7 +50,7 @@ fn seed(layout: &Layout, old: &Path) {
     let candidate = layout.path("runtime/generated/php.ini").unwrap();
     service_config::prepare(
         layout,
-        "php:php-fixture",
+        &layout.path("bin/php/fixture/php.ini").unwrap(),
         Kind::Php,
         &head,
         "",
@@ -51,7 +59,13 @@ fn seed(layout: &Layout, old: &Path) {
         None,
     )
     .unwrap();
-    let file = service_config::commit(layout, "php:php-fixture", &candidate).unwrap();
+    let file = service_config::commit(
+        layout,
+        &layout.path("bin/php/fixture/php.ini").unwrap(),
+        Kind::Php,
+        &candidate,
+    )
+    .unwrap();
     for path in [&file, &file.with_extension("managed.json")] {
         let text = fs::read_to_string(path).unwrap();
         // JSON strings use forward slashes in this fixture's managed fields.
@@ -59,7 +73,7 @@ fn seed(layout: &Layout, old: &Path) {
         atomic_write(path, text.as_bytes()).unwrap();
     }
     let state = serde_json::json!({"records":[], "token":"0123456789abcdef0123456789abcdef",
-        "applied": config, "applied_files": { old.join("config/services/php/php-fixture/php.ini").to_str().unwrap(): [] }});
+        "applied": config, "applied_files": { old.join("bin/php/fixture/php.ini").to_str().unwrap(): [] }});
     atomic_write(
         &layout.path("runtime/state/processes.json").unwrap(),
         &serde_json::to_vec(&state).unwrap(),
@@ -77,14 +91,20 @@ fn legacy_paths_relocate_without_accessing_old_directory_and_stay_unchanged_on_r
     let config = layout.load().unwrap();
     assert_eq!(
         config.php[0].directory_entry.directory,
-        Path::new("www/中文 网站")
+        Path::new("www/site space")
     );
-    let file = service_config::path(&layout, "php:php-fixture").unwrap();
+    let file = layout.path("bin/php/fixture/php.ini").unwrap();
     let text = fs::read_to_string(&file).unwrap();
     assert!(text.contains("memory_limit=321M"));
     assert!(text.contains(&apache_path(&layout.root).unwrap()));
     assert!(!text.contains("旧目录"));
-    service_config::validate_edit(&layout, "php:php-fixture", Kind::Php, &text).unwrap();
+    service_config::validate_edit(
+        &layout,
+        &layout.path("bin/php/fixture/php.ini").unwrap(),
+        Kind::Php,
+        &text,
+    )
+    .unwrap();
     assert!(
         Engine::new(layout.clone())
             .unwrap()
@@ -137,7 +157,7 @@ fn path_prefixes_respect_boundaries_slashes_case_and_unicode() {
 fn current_external_site_is_preserved_and_internal_site_is_saved_relative() {
     let layout = environment();
     let mut config = Config::default();
-    let sibling = layout.root.parent().unwrap().join("独立站点");
+    let sibling = layout.root.parent().unwrap().join("independent site");
     config.php.push(PhpSpec {
         package: "php-fixture".into(),
         port: 19111,
@@ -224,7 +244,7 @@ fn redis_password_is_preserved_on_relocation_and_backups_are_protected() {
     let candidate = layout.path("runtime/generated/redis.conf").unwrap();
     service_config::prepare(
         &layout,
-        "redis",
+        &layout.path("bin/redis/fixture/redis.conf").unwrap(),
         Kind::Redis,
         &head,
         "",
@@ -233,7 +253,13 @@ fn redis_password_is_preserved_on_relocation_and_backups_are_protected() {
         None,
     )
     .unwrap();
-    let file = service_config::commit(&layout, "redis", &candidate).unwrap();
+    let file = service_config::commit(
+        &layout,
+        &layout.path("bin/redis/fixture/redis.conf").unwrap(),
+        Kind::Redis,
+        &candidate,
+    )
+    .unwrap();
     for path in [&file, &file.with_extension("managed.json")] {
         let text = fs::read_to_string(path).unwrap();
         atomic_write(
@@ -303,7 +329,7 @@ fn invalid_native_config_is_rejected_before_any_paths_are_committed() {
     let layout = environment();
     let old = old_root(&layout);
     seed(&layout, &old);
-    let path = service_config::path(&layout, "php:php-fixture").unwrap();
+    let path = layout.path("bin/php/fixture/php.ini").unwrap();
     let mut text = fs::read_to_string(&path).unwrap();
     text.push_str("\nport=22\nauto_prepend_file=../outside.php\n");
     atomic_write(&path, text.as_bytes()).unwrap();
@@ -320,7 +346,8 @@ fn native_backups_are_not_treated_as_active_configuration() {
     let layout = environment();
     let old = old_root(&layout);
     seed(&layout, &old);
-    let path = service_config::path(&layout, "php:php-fixture")
+    let path = layout
+        .path("bin/php/fixture/php.ini")
         .unwrap()
         .with_file_name("php.backup.ini");
     let text = format!("backup at {}", old.display());

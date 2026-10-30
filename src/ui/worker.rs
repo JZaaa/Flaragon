@@ -17,6 +17,7 @@ pub(super) enum Command {
     Stop(String),
     Restart(String),
     Reload(String),
+    RemoveMissing(String),
     Apply(Config),
     Settings(Config),
     Startup(crate::startup::Settings),
@@ -268,6 +269,7 @@ pub(super) fn worker(layout: Layout, rx: Receiver<Command>, tx: SyncSender<Event
             Command::Stop(id) => engine.stop(&id),
             Command::Restart(id) => engine.restart(&id),
             Command::Reload(id) => engine.reload(&id),
+            Command::RemoveMissing(id) => engine.remove_missing_service(&id),
             Command::Apply(config) => engine.apply(config),
             Command::Settings(config) => engine.apply_settings(config),
             Command::InspectMysql(..) => unreachable!(),
@@ -290,7 +292,8 @@ pub(super) fn worker(layout: Layout, rx: Receiver<Command>, tx: SyncSender<Event
             Command::Read(id, log) => {
                 let text = read_text(&engine, &id, log);
                 let path = if !log {
-                    crate::service_config::path(&engine.layout, &id)
+                    engine
+                        .service_config_path(&id)
                         .ok()
                         .map(|p| p.display().to_string())
                 } else {

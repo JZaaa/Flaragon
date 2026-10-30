@@ -23,6 +23,7 @@ pub struct Row {
     pub ports: String,
     pub detail: String,
     pub running: bool,
+    pub missing: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Record {
@@ -102,6 +103,61 @@ pub struct MysqlAdoptionConfirmation {
     pub config_confirmed: bool,
 }
 impl Engine {
+    fn missing_package(&self, config: &Config, id: &str) -> bool {
+        config.service_package(id).is_ok_and(|(kind, package)| {
+            !self
+                .packages
+                .iter()
+                .any(|p| p.kind == kind && p.id == package)
+        })
+    }
+
+    fn deferred_config(&self, config: &Config, id: &str) -> Result<bool> {
+        if self.missing_package(config, id) {
+            return Ok(true);
+        }
+        Ok(id == "apache"
+            && config
+                .apache_dependencies()?
+                .iter()
+                .any(|id| self.missing_package(config, id)))
+    }
+
+    pub fn remove_missing_service(&mut self, id: &str) -> Result<()> {
+        self.config.service_package(id)?;
+        // Recheck discovery without adding or selecting services as a side effect.
+        self.packages = discovery::scan_cached(&self.layout, &mut self.discovery_cache)?;
+        ensure!(
+            self.missing_package(&self.config, id),
+            "组件仍存在或已恢复，请刷新列表；只能移除缺失组件"
+        );
+        let mut candidate = self.config.without_service(id)?;
+        self.config
+            .validate_settings_change(&candidate, &self.running_ids())?;
+        candidate.revision = self
+            .config
+            .revision
+            .checked_add(1)
+            .context("配置版本号超出范围")?;
+        candidate.validate(&self.layout)?;
+        atomic_write(
+            &self.layout.path("config/app.backup.json")?,
+            &serde_json::to_vec_pretty(&self.config)?,
+        )?;
+        self.layout.save(&candidate)?;
+        self.config = candidate;
+        self.running.remove(id);
+        self.errors.remove(id);
+        self.applied = None;
+        // Deleted files must not be recreated by a later configuration rollback.
+        self.applied_files
+            .retain(|path, _| self.layout.path(path).is_ok_and(|path| path.is_file()));
+        self.message = "已移除缺失组件的服务记录；项目、配置文件和数据均保留".into();
+        self.persist()
+            .context("移除已保存，但运行状态记录更新失败")?;
+        Ok(())
+    }
+
     pub fn running_ids(&self) -> Vec<String> {
         self.running
             .iter()
@@ -223,7 +279,7 @@ impl Engine {
             "检查后配置发生变化，请重新检查"
         );
         mysql_network::preflight(spec.port, mysql_network::dual_loopback(&package.version)?)?;
-        let conf = service_config::commit(&self.layout, &format!("mysql:{}", spec.id), &candidate)?;
+        let conf = self.commit_service_config(&format!("mysql:{}", spec.id), &candidate)?;
         let pending = self
             .layout
             .path(report.path.join(crate::mysql_data::ADOPTING))?;
@@ -343,8 +399,22 @@ impl Engine {
             })
             .collect();
         let mut files = BTreeMap::new();
+        let deferred = changed
+            .iter()
+            .filter_map(|id| match self.deferred_config(&candidate, id) {
+                Ok(true) => Some(Ok(id.clone())),
+                Ok(false) => None,
+                Err(e) => Some(Err(e)),
+            })
+            .collect::<Result<BTreeSet<_>>>()?;
         for id in &changed {
-            files.extend(service_config::snapshot(&self.layout, id)?);
+            if self.missing_package(&candidate, id) {
+                continue;
+            }
+            files.extend(service_config::snapshot(
+                &self.layout,
+                &self.service_config_path_for(&candidate, id)?,
+            )?);
         }
         self.config = candidate;
         let result: Result<()> = (|| {
@@ -355,6 +425,7 @@ impl Engine {
                     self.config
                         .service_usage(id)
                         .is_ok_and(|u| u != ServiceUsage::Disabled)
+                        && !deferred.contains(*id)
                 })
                 .map(|id| self.service_candidate(id).map(|path| (id, path)))
                 .collect::<Result<Vec<_>>>()?;
@@ -363,7 +434,7 @@ impl Engine {
                 &serde_json::to_vec_pretty(&old)?,
             )?;
             for (id, path) in prepared {
-                service_config::commit(&self.layout, id, &path)?;
+                self.commit_service_config(id, &path)?;
             }
             self.layout.save(&self.config)?;
             Ok(())
@@ -385,7 +456,11 @@ impl Engine {
                 }
             );
         }
-        self.message = "环境设置已保存；运行中的服务保持运行".into();
+        self.message = if deferred.is_empty() {
+            "环境设置已保存；运行中的服务保持运行".into()
+        } else {
+            "环境设置已保存；缺失组件关联配置尚未校验，运行中的服务保持运行".into()
+        };
         self.persist()?;
         Ok(())
     }
@@ -484,49 +559,59 @@ impl Engine {
         Ok(p)
     }
     fn ensure_overrides(&self) -> Result<()> {
-        for php in &self.config.php {
-            let file = self.layout.php_ini(&php.package)?;
-            if !file.exists() {
-                atomic_write(&file,b"; PHP settings: memory_limit, upload_max_filesize, post_max_size, max_execution_time, date.timezone, display_errors, error_reporting, extension\nmemory_limit = 256M\nupload_max_filesize = 32M\npost_max_size = 40M\ndate.timezone = Asia/Shanghai\ndisplay_errors = On\nerror_reporting = E_ALL\n")?;
-            }
-        }
-        for mysql in &self.config.mysql {
-            let file = self
-                .layout
-                .path(format!("config/overrides/mysql/{}.ini", mysql.id))?;
-            if !file.exists() {
-                atomic_write(&file,b"# MySQL settings: max_connections, innodb_buffer_pool_size, sql_mode, wait_timeout\nmax_connections=100\ninnodb_buffer_pool_size=64M\n")?;
-            }
-        }
-        let redis = self.layout.path("config/overrides/redis.conf")?;
-        if !redis.exists() {
-            atomic_write(&redis,b"# Redis settings: maxmemory, maxmemory-policy, appendonly, save, databases\nappendonly yes\nsave 60 1\n")?;
-        }
         let apache = self.layout.path("config/overrides/apache.conf")?;
         if !apache.exists() {
             atomic_write(&apache,b"# Apache settings: Timeout, KeepAlive, MaxKeepAliveRequests, KeepAliveTimeout\nTimeout 60\nKeepAlive On\n")?;
         }
         Ok(())
     }
-    pub fn override_path(&self, id: &str) -> Result<PathBuf> {
+    pub fn service_config_path(&self, id: &str) -> Result<PathBuf> {
+        self.service_config_path_for(&self.config, id)
+    }
+    fn service_config_path_for(&self, config: &Config, id: &str) -> Result<PathBuf> {
         if id == "apache" {
-            return self.layout.path("config/overrides/apache.conf");
+            return self.layout.path("config/services/apache/httpd.conf");
         }
-        if id == "redis" {
-            return self.layout.path("config/overrides/redis.conf");
-        }
-        if let Some(p) = id.strip_prefix("php:") {
-            return self.layout.php_ini(p);
-        }
-        if let Some(p) = id.strip_prefix("mysql:") {
-            valid_id(p)?;
-            return self.layout.path(format!("config/overrides/mysql/{p}.ini"));
-        }
-        bail!("未知服务")
+        let (package, kind) = if let Some(p) = id.strip_prefix("php:") {
+            (p, Kind::Php)
+        } else if let Some(instance) = id.strip_prefix("mysql:") {
+            (
+                config
+                    .mysql
+                    .iter()
+                    .find(|s| s.id == instance)
+                    .context("MySQL 服务不存在")?
+                    .package
+                    .as_str(),
+                Kind::Mysql,
+            )
+        } else if id == "redis" {
+            (
+                config
+                    .redis
+                    .as_ref()
+                    .context("Redis 服务不存在")?
+                    .package
+                    .as_str(),
+                Kind::Redis,
+            )
+        } else {
+            bail!("未知服务")
+        };
+        service_config::package_path(&self.layout, self.package(package, kind)?, id)
+    }
+    fn commit_service_config(&self, id: &str, candidate: &Path) -> Result<PathBuf> {
+        service_config::commit(
+            &self.layout,
+            &self.service_config_path(id)?,
+            self.service_kind(id)?,
+            candidate,
+        )
     }
     pub fn save_override(&mut self, id: &str, text: &str) -> Result<()> {
         self.read_service_config(id)?;
-        let full = service_config::replace_user(&self.layout, id, text)?;
+        let full =
+            service_config::replace_user(&self.layout, &self.service_config_path(id)?, text)?;
         self.save_service_config(id, &full)
     }
     fn service_kind(&self, id: &str) -> Result<Kind> {
@@ -566,15 +651,20 @@ impl Engine {
     }
     pub fn read_service_config(&self, id: &str) -> Result<String> {
         self.service_kind(id)?;
-        if service_config::needs_template(&self.layout, id)? {
+        if service_config::needs_template(&self.layout, &self.service_config_path(id)?)? {
             let candidate = self.service_candidate(id)?;
-            service_config::commit(&self.layout, id, &candidate)?;
+            self.commit_service_config(id, &candidate)?;
         }
-        service_config::read(&self.layout, id)
+        service_config::read(&self.layout, &self.service_config_path(id)?)
     }
     pub fn save_service_config(&mut self, id: &str, text: &str) -> Result<()> {
-        service_config::validate_edit(&self.layout, id, self.service_kind(id)?, text)?;
-        let file = service_config::path(&self.layout, id)?;
+        service_config::validate_edit(
+            &self.layout,
+            &self.service_config_path(id)?,
+            self.service_kind(id)?,
+            text,
+        )?;
+        let file = self.service_config_path(id)?;
         let before = fs::read(&file)?;
         atomic_write(
             &self.layout.path(file.with_extension("before-edit"))?,
@@ -597,7 +687,13 @@ impl Engine {
     fn configuration_files(&self) -> Result<BTreeMap<PathBuf, Vec<u8>>> {
         let mut result = BTreeMap::new();
         for id in self.service_ids() {
-            result.extend(service_config::snapshot(&self.layout, &id)?);
+            if self.missing_package(&self.config, &id) {
+                continue;
+            }
+            result.extend(service_config::snapshot(
+                &self.layout,
+                &self.service_config_path(&id)?,
+            )?);
         }
         Ok(result)
     }
@@ -667,7 +763,10 @@ impl Engine {
                 v.iter()
                     .any(|p| p.process.running() && p.record.ports.is_empty())
             });
-            let state = if self.errors.contains_key(&id) {
+            let missing = self.missing_package(&self.config, &id);
+            let state = if missing && alive == 0 {
+                "组件缺失"
+            } else if self.errors.contains_key(&id) {
                 "异常"
             } else if initializing {
                 "初始化中"
@@ -699,6 +798,7 @@ impl Engine {
                 ports,
                 detail,
                 running: alive > 0,
+                missing,
             });
         }
         Snapshot {
@@ -1030,7 +1130,7 @@ impl Engine {
             "存在未应用设置，请先应用设置"
         );
         let active = parent.record.config.clone();
-        let override_path = service_config::path(&self.layout, "apache")?;
+        let override_path = self.service_config_path("apache")?;
         ensure!(
             active == override_path,
             "当前进程使用旧配置路径，请先重启 Apache"
@@ -1180,9 +1280,17 @@ impl Engine {
         self.applied = state.applied;
         for (path, bytes) in state.applied_files {
             let checked = self.layout.path(&path)?;
+            let relative = self.layout.relative(&checked)?;
+            if relative.starts_with("config/services")
+                && !relative.starts_with("config/services/apache")
+                || relative.starts_with("config/overrides")
+                    && relative != Path::new("config/overrides/apache.conf")
+            {
+                self.applied = None;
+                continue;
+            }
             ensure!(
-                checked.starts_with(self.layout.path("config/overrides")?)
-                    || checked.starts_with(self.layout.path("config/services")?),
+                crate::relocation::is_config_path(&relative),
                 "运行配置快照路径无效"
             );
             self.applied_files
@@ -1230,14 +1338,13 @@ impl Engine {
                     .path(format!("logs/php-{}-error.log", spec.package))?
             )?
         );
-        let overrides = fs::read_to_string(self.layout.php_ini(&spec.package)?)?;
         service_config::prepare(
             &self.layout,
-            &format!("php:{}", spec.package),
+            &self.service_config_path(&format!("php:{}", spec.package))?,
             Kind::Php,
             &text,
             "",
-            &format!("log_errors=On\n{overrides}"),
+            "",
             &out,
             Some(&crate::config_template::load(
                 &self.layout,
@@ -1269,7 +1376,7 @@ impl Engine {
             .clone();
         let package = self.package(id, Kind::Php)?.clone();
         let candidate = self.php_config(&spec)?;
-        let ini = service_config::commit(&self.layout, &format!("php:{id}"), &candidate)?;
+        let ini = self.commit_service_config(&format!("php:{id}"), &candidate)?;
         fs::create_dir_all(self.layout.path("runtime/empty-ini")?)?;
         for offset in 0..spec.workers {
             let port = spec.port + offset;
@@ -1298,10 +1405,6 @@ impl Engine {
             "MySQL 数据目录版本与组件不匹配"
         );
         let out = self.generated()?.join(format!("mysql-{}.ini", spec.id));
-        let extra = fs::read_to_string(
-            self.layout
-                .path(format!("config/overrides/mysql/{}.ini", spec.id))?,
-        )?;
         let mut text = format!(
             "[mysqld]\nbasedir=\"{}\"\ndatadir=\"{}\"\nport={}\nbind-address={}\nlog-error=\"{}\"\npid-file=\"{}\"\ntmpdir=\"{}\"\nsecure-file-priv=NULL\nlocal-infile=0\n",
             apache_path(&p.directory)?,
@@ -1320,11 +1423,11 @@ impl Engine {
         }
         service_config::prepare(
             &self.layout,
-            &format!("mysql:{}", spec.id),
+            &self.service_config_path(&format!("mysql:{}", spec.id))?,
             Kind::Mysql,
             &text,
             "",
-            &format!("character-set-server=utf8mb4\n{extra}"),
+            "",
             &out,
             Some(&crate::config_template::load(
                 &self.layout,
@@ -1370,7 +1473,7 @@ impl Engine {
         let p = self.package(&spec.package, Kind::Mysql)?.clone();
         mysql_network::preflight(spec.port, mysql_network::dual_loopback(&p.version)?)?;
         let candidate = self.mysql_config(&spec)?;
-        let conf = service_config::commit(&self.layout, &format!("mysql:{id}"), &candidate)?;
+        let conf = self.commit_service_config(&format!("mysql:{id}"), &candidate)?;
         let dir = spec.data_path(&self.layout)?;
         let marker = spec.binding_path(&self.layout)?;
         self.inspect_mysql(&spec)?;
@@ -1458,7 +1561,6 @@ impl Engine {
         let spec = self.config.redis.as_ref().context("未发现 Redis")?;
         let package = self.package(&spec.package, Kind::Redis)?;
         let out = self.generated()?.join("redis.conf");
-        let extra = fs::read_to_string(self.layout.path("config/overrides/redis.conf")?)?;
         let text = format!(
             "bind 127.0.0.1\nprotected-mode yes\nport {}\ndir \"{}\"\ndbfilename dump.rdb\nlogfile \"{}\"\n",
             spec.port,
@@ -1467,11 +1569,11 @@ impl Engine {
         );
         service_config::prepare(
             &self.layout,
-            "redis",
+            &self.service_config_path("redis")?,
             Kind::Redis,
             &text,
             "",
-            &extra,
+            "",
             &out,
             Some(&crate::config_template::load(
                 &self.layout,
@@ -1486,7 +1588,7 @@ impl Engine {
         let spec = self.config.redis.as_ref().context("未发现 Redis")?.clone();
         let p = self.package(&spec.package, Kind::Redis)?.clone();
         let candidate = self.redis_config()?;
-        let conf = service_config::commit(&self.layout, "redis", &candidate)?;
+        let conf = self.commit_service_config("redis", &candidate)?;
         self.launch(
             "redis",
             Kind::Redis,
@@ -1586,7 +1688,7 @@ impl Engine {
         let text = crate::web::routes(&self.layout, &self.config, &dir, &self.token)?;
         let conf = service_config::prepare(
             &self.layout,
-            "apache",
+            &self.service_config_path("apache")?,
             Kind::Apache,
             &head,
             &text,
@@ -1609,7 +1711,7 @@ impl Engine {
     fn start_apache(&mut self) -> Result<()> {
         self.config.apache_dependencies()?;
         let candidate = self.apache_config()?;
-        let conf = service_config::commit(&self.layout, "apache", &candidate)?;
+        let conf = self.commit_service_config("apache", &candidate)?;
         for id in self.config.apache_dependencies()? {
             self.start(&id)?;
         }
@@ -1711,7 +1813,7 @@ impl Engine {
                 .eq_ignore_ascii_case(expected.trim_end_matches('/'))),
             "入口根目录未生效：{host}:{port}"
         );
-        let ini = apache_path(&service_config::path(&self.layout, &format!("php:{php}"))?)?;
+        let ini = apache_path(&self.service_config_path(&format!("php:{php}"))?)?;
         ensure!(
             json["ini"]
                 .as_str()
@@ -1737,7 +1839,20 @@ impl Engine {
         };
         let old_applied = self.applied.clone();
         let was_running = self.has_running();
-        let old_ids = self.running.keys().cloned().collect::<Vec<_>>();
+        let old_ids = self.running_ids();
+        let deferred = self
+            .service_ids_for(&candidate)
+            .into_iter()
+            .filter_map(|id| match self.deferred_config(&candidate, &id) {
+                Ok(true) => Some(Ok(id)),
+                Ok(false) => None,
+                Err(e) => Some(Err(e)),
+            })
+            .collect::<Result<BTreeSet<_>>>()?;
+        ensure!(
+            !old_ids.iter().any(|id| deferred.contains(id)),
+            "缺失组件关联的服务仍有运行记录，请先停止后再修改项目"
+        );
         let candidate_token = platform::random_token()?;
         self.config = candidate;
         self.token = candidate_token;
@@ -1746,6 +1861,7 @@ impl Engine {
             let candidates = self
                 .service_ids()
                 .into_iter()
+                .filter(|id| !deferred.contains(id))
                 .map(|id| self.service_candidate(&id).map(|path| (id, path)))
                 .collect::<Result<Vec<_>>>()?;
             atomic_write(
@@ -1771,7 +1887,7 @@ impl Engine {
         }
         let commit_result = (|| {
             for (id, path) in &candidates {
-                service_config::commit(&self.layout, id, path)?;
+                self.commit_service_config(id, path)?;
             }
             self.layout.save(&self.config)
         })();
@@ -1860,12 +1976,19 @@ impl Engine {
                 self.persist()?;
                 bail!("应用失败：{e}；上一配置：{restored}");
             }
-            self.applied = Some(self.config.clone());
+            self.applied = deferred.is_empty().then(|| self.config.clone());
             self.applied_files = self.configuration_files()?;
-            self.message = "配置已应用，运行结果已验证".into();
+            self.message = if deferred.is_empty() {
+                "配置已应用，运行结果已验证".into()
+            } else {
+                "设置已保存，原运行服务已恢复；缺失组件及相关网站配置尚未校验".into()
+            };
         } else {
-            self.message =
-                "完整配置已保存并完成预检查；启动后验证生效（Redis 语法由启动验证）".into();
+            self.message = if deferred.is_empty() {
+                "完整配置已保存并完成预检查；启动后验证生效（Redis 语法由启动验证）".into()
+            } else {
+                "设置已保存；缺失组件及相关网站配置尚未校验，请切换项目 PHP 后移除缺失组件".into()
+            };
             self.applied = None;
         }
         self.persist()?;

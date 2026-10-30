@@ -26,6 +26,7 @@ fn main() -> Result<()> {
             let id = value["id"].as_str().unwrap_or_default();
             match action {
                 "scan" => engine.scan()?,
+                "remove_missing" => engine.remove_missing_service(id)?,
                 "mysql_directory" => {
                     let spec = engine
                         .config
@@ -66,7 +67,7 @@ fn main() -> Result<()> {
                     let text = engine.read_service_config(id)?;
                     return Ok(
                         serde_json::json!({"ok": true, "snapshot": engine.snapshot(), "text": text,
-                        "path": flaragon::service_config::path(&engine.layout, id)?}),
+                        "path": engine.service_config_path(id)?}),
                     );
                 }
                 "save_config" => {

@@ -150,7 +150,10 @@ impl State {
     }
     fn send(&mut self, ui: &MainWindow, command: Command) -> Result<()> {
         crate::ensure!(!self.pending, "正在处理上一项操作，请稍候");
-        self.applying = matches!(&command, Command::Apply(_) | Command::Settings(_));
+        self.applying = matches!(
+            &command,
+            Command::Apply(_) | Command::Settings(_) | Command::RemoveMissing(_)
+        );
         match self.tx.try_send(command) {
             Ok(()) => (),
             Err(mpsc::TrySendError::Full(_)) => crate::bail!("后台任务队列已满，请稍后重试"),
@@ -175,68 +178,80 @@ impl State {
     }
     fn populate(&mut self, ui: &MainWindow, s: Snapshot, error: Option<String>) {
         let initial = self.snapshot.is_none();
+        let services: Vec<_> = s
+            .rows
+            .iter()
+            .map(|r| {
+                let (kind, package) = if r.id == "apache" {
+                    (Kind::Apache, s.config.apache.as_deref())
+                } else if r.id == "redis" {
+                    (
+                        Kind::Redis,
+                        s.config.redis.as_ref().map(|p| p.package.as_str()),
+                    )
+                } else if let Some(id) = r.id.strip_prefix("php:") {
+                    (Kind::Php, Some(id))
+                } else {
+                    (
+                        Kind::Mysql,
+                        s.config
+                            .mysql
+                            .iter()
+                            .find(|p| r.id == format!("mysql:{}", p.id))
+                            .map(|p| p.package.as_str()),
+                    )
+                };
+                let p = s.packages.iter().find(|p| Some(p.id.as_str()) == package);
+                let active = r.running;
+                ServiceRow {
+                    id: r.id.clone().into(),
+                    name: p.map(|p| p.label()).unwrap_or(&r.title).into(),
+                    subtitle: format!(
+                        "{} · {}{}",
+                        kind.label(),
+                        p.map(|p| p.version.as_str()).unwrap_or("组件缺失"),
+                        r.id.strip_prefix("mysql:")
+                            .map(|id| format!(
+                                " · {}",
+                                s.config
+                                    .mysql
+                                    .iter()
+                                    .find(|m| m.id == id)
+                                    .map(|m| m.name.as_str())
+                                    .unwrap_or(id)
+                            ))
+                            .unwrap_or_default()
+                    )
+                    .into(),
+                    module: kind.label().into(),
+                    common: s
+                        .config
+                        .service_usage(&r.id)
+                        .is_ok_and(|usage| usage == ServiceUsage::Common),
+                    state: r.state.clone().into(),
+                    ports: r.ports.clone().into(),
+                    detail: r.detail.clone().into(),
+                    running: active,
+                    missing: r.missing,
+                    can_remove: r.missing
+                        && !active
+                        && !(kind == Kind::Php
+                            && s.rows.iter().any(|r| r.id == "apache" && r.running)),
+                    can_start: !r.missing && r.state != "运行中",
+                    can_stop: active,
+                }
+            })
+            .collect();
+        ui.set_missing_services(model(
+            services.iter().filter(|r| r.missing).cloned().collect(),
+        ));
         ui.set_services(model(
-            s.rows
-                .iter()
+            services
+                .into_iter()
                 .filter(|r| {
                     s.config
                         .service_usage(&r.id)
                         .is_ok_and(|u| u != ServiceUsage::Disabled)
-                })
-                .map(|r| {
-                    let (kind, package) = if r.id == "apache" {
-                        (Kind::Apache, s.config.apache.as_deref())
-                    } else if r.id == "redis" {
-                        (
-                            Kind::Redis,
-                            s.config.redis.as_ref().map(|p| p.package.as_str()),
-                        )
-                    } else if let Some(id) = r.id.strip_prefix("php:") {
-                        (Kind::Php, Some(id))
-                    } else {
-                        (
-                            Kind::Mysql,
-                            s.config
-                                .mysql
-                                .iter()
-                                .find(|p| r.id == format!("mysql:{}", p.id))
-                                .map(|p| p.package.as_str()),
-                        )
-                    };
-                    let p = s.packages.iter().find(|p| Some(p.id.as_str()) == package);
-                    let active = r.running;
-                    ServiceRow {
-                        id: r.id.clone().into(),
-                        name: p.map(|p| p.label()).unwrap_or(&r.title).into(),
-                        subtitle: format!(
-                            "{} · {}{}",
-                            kind.label(),
-                            p.map(|p| p.version.as_str()).unwrap_or("组件缺失"),
-                            r.id.strip_prefix("mysql:")
-                                .map(|id| format!(
-                                    " · {}",
-                                    s.config
-                                        .mysql
-                                        .iter()
-                                        .find(|m| m.id == id)
-                                        .map(|m| m.name.as_str())
-                                        .unwrap_or(id)
-                                ))
-                                .unwrap_or_default()
-                        )
-                        .into(),
-                        module: kind.label().into(),
-                        common: s
-                            .config
-                            .service_usage(&r.id)
-                            .is_ok_and(|usage| usage == ServiceUsage::Common),
-                        state: r.state.clone().into(),
-                        ports: r.ports.clone().into(),
-                        detail: r.detail.clone().into(),
-                        running: active,
-                        can_start: r.state != "运行中",
-                        can_stop: active,
-                    }
                 })
                 .collect(),
         ));
@@ -602,6 +617,48 @@ impl State {
     }
     fn action(&mut self, ui: &MainWindow, name: &str, id: &str) -> Result<()> {
         match name {
+            "remove-missing" => {
+                let s = self.snapshot.as_ref().context("环境尚未加载")?;
+                crate::ensure!(
+                    s.rows.iter().any(|r| r.id == id && r.missing),
+                    "请刷新列表，只能移除缺失组件"
+                );
+                let candidate = s.config.without_service(id)?;
+                s.config.validate_settings_change(
+                    &candidate,
+                    &s.rows
+                        .iter()
+                        .filter(|r| r.running)
+                        .map(|r| r.id.clone())
+                        .collect::<Vec<_>>(),
+                )?;
+                let data = if let Some(instance) = id.strip_prefix("mysql:") {
+                    let spec = s
+                        .config
+                        .mysql
+                        .iter()
+                        .find(|m| m.id == instance)
+                        .context("MySQL 不存在")?;
+                    let path = if spec.series.is_empty() {
+                        self.layout.path(format!("data/mysql/{}", spec.id))?
+                    } else {
+                        spec.data_path(&self.layout)?
+                    };
+                    format!(
+                        "\n数据位置：{}\n如需删除数据，请自行前往该目录删除。",
+                        path.display()
+                    )
+                } else if id.starts_with("php:") {
+                    "\n对应目录入口随记录移除；无项目引用的默认 PHP 选择会清空。".into()
+                } else {
+                    String::new()
+                };
+                if confirm(&format!(
+                    "确认移除缺失组件 {id} 的服务记录？\n项目、配置文件和数据均保留。{data}\n移除后将重新加载环境设置，请先保存需要保留的表单修改。"
+                )) {
+                    self.send(ui, Command::RemoveMissing(id.into()))?;
+                }
+            }
             "project-filter" => self.filter_projects(ui),
             "projects-share" | "projects-local" => {
                 let mut c = self.candidate()?.config.clone();
