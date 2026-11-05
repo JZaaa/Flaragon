@@ -30,6 +30,7 @@ pub enum Mode {
     Install,
     Update,
     Repair,
+    Unified,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -173,6 +174,7 @@ impl Package {
             0 => Mode::Install,
             1 => Mode::Update,
             2 => Mode::Repair,
+            3 => Mode::Unified,
             _ => bail!("载荷模式无效"),
         };
         file.seek(SeekFrom::Start(size - 25 - length))?;
@@ -203,7 +205,7 @@ impl Package {
                 .to_owned();
             if name != RELEASE
                 && !(mode == Mode::Repair && name == REPAIR_BASE)
-                && !(mode == Mode::Update && name == UPDATE_BASE)
+                && !(matches!(mode, Mode::Update | Mode::Unified) && name == UPDATE_BASE)
             {
                 program_file(&name)?;
             }
@@ -236,7 +238,7 @@ impl Package {
             .map(|bytes| -> Result<Manifest> {
                 let base: Manifest = serde_json::from_slice(&bytes)?;
                 base.validate()?;
-                repair_allowed(&base, &manifest)?;
+                overwrite_allowed(&base, &manifest)?;
                 Ok(base)
             })
             .transpose()?;
@@ -266,7 +268,7 @@ impl Package {
                 self.update_base.as_ref() == Some(old),
                 "此安装不属于覆盖升级包指定的原始构建"
             );
-            repair_allowed(old, &self.manifest)
+            overwrite_allowed(old, &self.manifest)
         } else {
             upgrade_allowed(old, &self.manifest)
         }
@@ -447,6 +449,15 @@ fn maintain(root: &Path) -> Result<()> {
 }
 
 fn write_program(root: &Path, destination: &Path, bytes: &[u8]) -> Result<()> {
+    let name = destination
+        .strip_prefix(root)
+        .context("部署写入路径越界")?
+        .to_str()
+        .context("部署文件名无效")?
+        .replace('\\', "/");
+    if !matches!(name.as_str(), RELEASE | INSTALLATION | ACTIVE | OWNER) {
+        program_file(&name)?;
+    }
     reject_links(destination)?;
     let temp = checked(
         root,
@@ -510,7 +521,7 @@ fn install_directory_empty(root: &Path) -> Result<()> {
         if owned && entry.file_name() == ".maintenance" {
             continue;
         }
-        bail!("安装目录非空，请选择新目录；已有正式安装请使用升级包");
+        bail!("目录非空且不是可识别的 Flaragon 安装，请选择新目录或有效的安装目录");
     }
     Ok(())
 }
@@ -535,16 +546,18 @@ impl Journal {
         self.next.validate()?;
         if let Some(old) = &self.previous {
             old.validate()?;
-            if self.mode == Mode::Repair
-                || (self.mode == Mode::Update && old.version == self.next.version)
-            {
+            if self.mode == Mode::Repair {
                 repair_allowed(old, &self.next)?;
+            } else if matches!(self.mode, Mode::Update | Mode::Unified)
+                && old.version == self.next.version
+            {
+                overwrite_allowed(old, &self.next)?;
             } else {
                 upgrade_allowed(old, &self.next)?;
             }
         }
         ensure!(
-            (self.mode != Mode::Install) == self.previous.is_some(),
+            self.mode == Mode::Unified || (self.mode != Mode::Install) == self.previous.is_some(),
             "更新记录模式无效"
         );
         Ok(())
@@ -579,7 +592,8 @@ fn pending(root: &Path, package: &Package) -> Result<Option<Journal>> {
             "未完成修复与此包的适用安装不符"
         );
     }
-    if package.mode == Mode::Update {
+    if package.mode == Mode::Update || (package.mode == Mode::Unified && journal.previous.is_some())
+    {
         package.update_allowed(journal.previous.as_ref().context("更新记录缺少原始安装")?)?;
     }
     ensure!(
@@ -593,7 +607,7 @@ fn pending(root: &Path, package: &Package) -> Result<Option<Journal>> {
             "安装身份与未完成记录不符"
         );
     } else {
-        ensure!(journal.mode == Mode::Install, "安装身份缺失，无法修复");
+        ensure!(journal.previous.is_none(), "安装身份缺失，无法修复");
     }
     if let Some(old) = &journal.previous {
         let current = installed(root)?;
@@ -619,18 +633,13 @@ fn upgrade_allowed(old: &Manifest, next: &Manifest) -> Result<()> {
         version(&next.version)? > version(&old.version)?,
         "当前版本相同或更高，已终止更新；不支持降级"
     );
-    if version(&next.version)? >= [0, 0, 4] {
-        ensure!(
-            old.version == next.minimum_version,
-            "此升级包仅支持从上一正式版本 {} 升级，当前为 {}；请按正式版本顺序升级",
-            next.minimum_version,
-            old.version
-        );
-    }
     ensure!(
         version(&old.version)? >= version(&next.minimum_version)?
             && !next.excluded_versions.contains(&old.version),
-        "当前版本不在此包支持的升级范围内"
+        "当前版本 {} 不在此包支持的升级范围内（最低 {}，目标 {}）",
+        old.version,
+        next.minimum_version,
+        next.version
     );
     ensure!(
         old.config_schema == next.config_schema,
@@ -645,6 +654,15 @@ fn upgrade_allowed(old: &Manifest, next: &Manifest) -> Result<()> {
     Ok(())
 }
 fn repair_allowed(old: &Manifest, next: &Manifest) -> Result<()> {
+    overwrite_allowed(old, next)?;
+    ensure!(
+        old.minimum_version == next.minimum_version
+            && old.excluded_versions == next.excluded_versions,
+        "专用修复包必须保持升级兼容范围"
+    );
+    Ok(())
+}
+fn overwrite_allowed(old: &Manifest, next: &Manifest) -> Result<()> {
     ensure!(
         old.version == next.version && old.release_id != next.release_id,
         "修复包仅适用于指定版本的未修复安装"
@@ -654,14 +672,12 @@ fn repair_allowed(old: &Manifest, next: &Manifest) -> Result<()> {
             && old.architecture == next.architecture
             && old.format == next.format
             && old.config_schema == next.config_schema
-            && old.minimum_version == next.minimum_version
-            && old.excluded_versions == next.excluded_versions
             && next.remove.is_empty()
             && old.files.keys().eq(next.files.keys())
             && old.files.iter().all(|(name, size)| {
                 name == "Flaragon.exe" || next.files.get(name) == Some(size)
             }),
-        "修复包必须保持产品版本、配置格式和程序文件集合"
+        "同版本更新必须保持产品版本、配置格式和程序文件集合"
     );
     Ok(())
 }
@@ -691,6 +707,23 @@ pub struct Review {
     pending: Option<Journal>,
 }
 impl Review {
+    pub fn button_label(&self, package: &Package) -> String {
+        format!(
+            "{}{}",
+            if self.pending.is_some() {
+                "继续"
+            } else {
+                "开始"
+            },
+            if package.mode == Mode::Repair {
+                "修复"
+            } else if self.previous.is_some() {
+                "升级"
+            } else {
+                "安装"
+            }
+        )
+    }
     pub fn description(&self, package: &Package) -> String {
         let current = self
             .previous
@@ -706,7 +739,7 @@ impl Review {
                 "此目录存在未完成操作，将继续修复目标版本。"
             } else if package.mode == Mode::Repair {
                 "已确认此安装适用修复包；修复后产品版本号保持不变。"
-            } else if package.mode == Mode::Update {
+            } else if self.previous.is_some() {
                 if current == package.manifest.version {
                     "已确认原始构建，允许同版本覆盖升级；产品版本号保持不变。"
                 } else {
@@ -739,7 +772,16 @@ fn inspect_with(
             pending: Some(journal),
         });
     }
-    let (identity, previous) = match package.mode {
+    let mode = if package.mode == Mode::Unified {
+        if checked(&root, INSTALLATION)?.exists() || checked(&root, RELEASE)?.exists() {
+            Mode::Update
+        } else {
+            Mode::Install
+        }
+    } else {
+        package.mode
+    };
+    let (identity, previous) = match mode {
         Mode::Install => {
             install_directory_empty(&root)?;
             (None, None)
@@ -769,6 +811,7 @@ fn inspect_with(
             }
             (Some(identity), Some(old))
         }
+        Mode::Unified => bail!("无法确定部署操作"),
     };
     configuration_check(&root)?;
     Ok(Review {
@@ -887,13 +930,14 @@ fn deploy_with(
         }
         if let Some(old) = &journal.previous {
             for name in &journal.next.remove {
+                program_file(name)?;
                 let path = checked(&root, name)?;
                 if old.files.contains_key(name) && path.exists() {
                     fs::remove_file(path)?;
                 }
             }
         }
-        if journal.mode == Mode::Install {
+        if journal.previous.is_none() {
             for name in ["bin/apache", "bin/php", "bin/mysql", "bin/redis"] {
                 fs::create_dir_all(checked(&root, name)?)?;
             }
@@ -933,7 +977,7 @@ fn deploy_with(
     }
     Ok(format!(
         "{}完成：Flaragon {}\n{}{}",
-        if package.mode == Mode::Install {
+        if journal.previous.is_none() {
             "安装"
         } else if package.mode == Mode::Repair {
             "修复"

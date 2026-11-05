@@ -52,7 +52,7 @@ pub fn password(text: &str) -> Result<Vec<u8>> {
     Ok(password)
 }
 
-fn arguments(line: &[u8]) -> Result<Vec<Vec<u8>>> {
+pub(crate) fn arguments(line: &[u8]) -> Result<Vec<Vec<u8>>> {
     let mut result = Vec::new();
     let mut i = 0;
     while i < line.len() {

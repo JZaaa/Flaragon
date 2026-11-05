@@ -17,6 +17,52 @@ fn layout() -> Layout {
 }
 
 #[test]
+fn database_binding_moves_to_editable_body_and_preserves_user_choice() {
+    for (kind, directive, value) in [
+        (Kind::Mysql, "bind-address=", "127.0.0.1,::1"),
+        (Kind::Redis, "bind ", "127.0.0.1"),
+    ] {
+        let layout = layout();
+        let file = layout.path("config/test.conf").unwrap();
+        let candidate = layout.path("runtime/generated/test.conf").unwrap();
+        let head = if kind == Kind::Mysql {
+            "[mysqld]\nport=3307\n"
+        } else {
+            "port 6380\n"
+        };
+        native::prepare(
+            &layout,
+            &file,
+            kind,
+            &format!("{head}{directive}{value}\n"),
+            "",
+            "# custom\n",
+            &candidate,
+            None,
+        )
+        .unwrap();
+        native::commit(&layout, &file, kind, &candidate).unwrap();
+        native::prepare(&layout, &file, kind, head, "", "", &candidate, None).unwrap();
+        native::commit(&layout, &file, kind, &candidate).unwrap();
+        let text = native::read(&layout, &file).unwrap();
+        assert!(text.find(directive).unwrap() > text.find("END FLARAGON INSTANCE").unwrap());
+        assert!(text.contains(&format!("{directive}{value}")));
+        let edited = text.replace(
+            &format!("{directive}{value}"),
+            &format!("{directive}0.0.0.0"),
+        );
+        native::validate_edit(&layout, &file, kind, &edited).unwrap();
+        fs::write(&file, &edited).unwrap();
+        native::prepare(&layout, &file, kind, head, "", "", &candidate, None).unwrap();
+        assert!(
+            fs::read_to_string(candidate)
+                .unwrap()
+                .contains(&format!("{directive}0.0.0.0"))
+        );
+    }
+}
+
+#[test]
 fn preserves_native_comments_sections_and_options_when_instance_settings_change() {
     let layout = layout();
     let owned_file = layout

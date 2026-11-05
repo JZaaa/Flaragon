@@ -22,7 +22,13 @@ pub fn needs_template(layout: &Layout, file: &Path) -> Result<bool> {
         return Ok(true);
     }
     let managed: Managed = serde_json::from_slice(&fs::read(layout.path(metadata(&file))?)?)?;
-    Ok(managed.template.is_none())
+    Ok(managed.template.is_none()
+        || managed.head.lines().any(|line| {
+            matches!(
+                crate::config_template::key(line).as_str(),
+                "bind" | "bind-address" | "protected-mode"
+            )
+        }))
 }
 
 /// Resolve the native file within the selected, already discovered component package.
@@ -144,7 +150,8 @@ pub fn prepare(
                 matches!(
                     (kind, key),
                     (Kind::Php, "log_errors")
-                        | (Kind::Mysql, "character-set-server")
+                        | (Kind::Mysql, "character-set-server" | "bind-address")
+                        | (Kind::Redis, "bind" | "protected-mode")
                         | (
                             Kind::Apache,
                             "ServerName" | "LogLevel" | "ThreadsPerChild" | "DirectoryIndex"
@@ -184,6 +191,23 @@ pub fn prepare(
     } else {
         body
     };
+    let mut body = body;
+    if !file.exists()
+        && kind == Kind::Mysql
+        && !body
+            .lines()
+            .any(|line| crate::config_template::key(line) == "bind-address")
+    {
+        body.push_str("\n[mysqld]\nbind-address=0.0.0.0\n");
+    }
+    if !file.exists()
+        && kind == Kind::Redis
+        && !body
+            .lines()
+            .any(|line| crate::config_template::key(line) == "bind")
+    {
+        body.push_str("\nbind 0.0.0.0\n");
+    }
     validate_user(layout, kind, &body)?;
     let managed = Managed {
         template: source,
@@ -295,7 +319,6 @@ pub fn validate_user(layout: &Layout, kind: Kind, text: &str) -> Result<()> {
                 "basedir",
                 "datadir",
                 "port",
-                "bind-address",
                 "log-error",
                 "pid-file",
                 "tmpdir",
@@ -326,7 +349,6 @@ pub fn validate_user(layout: &Layout, kind: Kind, text: &str) -> Result<()> {
                 "innodb-temp-tablespaces-dir",
             ],
             Kind::Redis => &[
-                "bind",
                 "port",
                 "tls-port",
                 "dir",
@@ -337,7 +359,6 @@ pub fn validate_user(layout: &Layout, kind: Kind, text: &str) -> Result<()> {
                 "pidfile",
                 "daemonize",
                 "supervised",
-                "protected-mode",
                 "replicaof",
                 "slaveof",
                 "cluster-enabled",

@@ -371,8 +371,13 @@ impl Layout {
         if !file.exists() {
             return Ok(Config::default());
         }
-        let config: Config =
+        let mut config: Config =
             serde_json::from_slice(&fs::read(file)?).context("无法读取 app.json")?;
+        for project in &mut config.projects {
+            if project.php.is_none() {
+                project.php = config.default_php.clone();
+            }
+        }
         config.validate(self)?;
         Ok(config)
     }

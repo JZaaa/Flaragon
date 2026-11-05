@@ -53,7 +53,7 @@ fn pass(_: &Path, _: &str) -> Result<()> {
 }
 
 #[test]
-fn previous_release_only_rejects_skips_without_changes_and_resumes() {
+fn unified_range_rejects_unsupported_sources_and_resumes_direct_upgrade() {
     let make = |ver: &str, minimum: &str, mode| {
         let mut p = package(ver, mode);
         p.manifest.minimum_version = minimum.into();
@@ -64,27 +64,60 @@ fn previous_release_only_rejects_skips_without_changes_and_resumes() {
     let root = fixture();
     let old = make("0.0.2", "0.0.1", Mode::Install);
     run(&old, &root, pass, None).unwrap();
-    let next = make("0.0.4", "0.0.3", Mode::Update);
+    let mut next = make("0.0.5", "0.0.3", Mode::Unified);
     let before = read_program(&root);
     let error = run(&next, &root, pass, None).unwrap_err().to_string();
-    assert!(error.contains("上一正式版本 0.0.3"));
+    assert!(error.contains("升级范围"));
     assert_eq!(before, read_program(&root));
     assert!(!root.join(ACTIVE).exists());
 
-    let previous = make("0.0.3", "0.0.1", Mode::Update);
-    run(&previous, &root, pass, None).unwrap();
+    next.manifest.minimum_version = "0.0.1".into();
+    next.files
+        .insert(RELEASE.into(), serde_json::to_vec(&next.manifest).unwrap());
+    assert_eq!(
+        inspect_with(&next, &root, pass)
+            .unwrap()
+            .button_label(&next),
+        "开始升级"
+    );
     assert!(run(&next, &root, pass, Some(1)).is_err());
+    assert_eq!(
+        inspect_with(&next, &root, pass)
+            .unwrap()
+            .button_label(&next),
+        "继续升级"
+    );
     run(&next, &root, pass, None).unwrap();
     assert_eq!(installed(&root).unwrap(), next.manifest);
     assert!(run(&next, &root, pass, None).is_err());
-    assert!(run(&previous, &root, pass, None).is_err());
+    assert!(run(&old, &root, pass, None).is_err());
+    let fresh = fixture();
+    assert_eq!(
+        inspect_with(&next, &fresh, pass)
+            .unwrap()
+            .button_label(&next),
+        "开始安装"
+    );
+    assert!(run(&next, &fresh, fail, None).is_err());
+    assert_eq!(
+        inspect_with(&next, &fresh, pass)
+            .unwrap()
+            .button_label(&next),
+        "继续安装"
+    );
+    let wrong = make("0.0.5", "0.0.1", Mode::Install);
+    assert!(run(&wrong, &fresh, pass, None).is_err());
+    run(&next, &fresh, pass, None).unwrap();
+    assert_eq!(installed(&fresh).unwrap(), next.manifest);
 }
 
 #[test]
-fn previous_release_is_exact_across_version_gaps_and_legacy_range_is_preserved() {
+fn upgrade_range_accepts_intermediate_versions_and_honors_exclusions() {
     let mut next = package("0.1.0", Mode::Update).manifest;
     next.minimum_version = "0.0.4".into();
     assert!(upgrade_allowed(&package("0.0.4", Mode::Install).manifest, &next).is_ok());
+    assert!(upgrade_allowed(&package("0.0.5", Mode::Install).manifest, &next).is_ok());
+    next.excluded_versions.insert("0.0.5".into());
     for ver in ["0.0.3", "0.0.5", "0.1.0", "0.2.0"] {
         assert!(upgrade_allowed(&package(ver, Mode::Install).manifest, &next).is_err());
     }
@@ -161,6 +194,28 @@ fn interrupted_bound_update_requires_exact_base_and_payload() {
     run(&next, &root, pass, None).unwrap();
     assert_eq!(installed(&root).unwrap(), next.manifest);
     assert!(ensure_ready(&root).is_ok());
+}
+
+#[test]
+fn unified_bound_update_can_expand_compatibility_without_weakening_build_binding() {
+    let root = fixture();
+    first(&root);
+    let mut next = overwrite_package();
+    next.mode = Mode::Unified;
+    next.manifest.minimum_version = "0.0.1".into();
+    next.files
+        .insert(RELEASE.into(), serde_json::to_vec(&next.manifest).unwrap());
+    assert!(repair_allowed(next.update_base.as_ref().unwrap(), &next.manifest).is_err());
+    let before = read_program(&root);
+    let mut wrong = overwrite_package();
+    wrong.mode = Mode::Unified;
+    wrong.update_base.as_mut().unwrap().release_id = "a".repeat(32);
+    assert!(run(&wrong, &root, pass, None).is_err());
+    assert_eq!(read_program(&root), before);
+    assert!(run(&next, &root, pass, Some(1)).is_err());
+    run(&next, &root, pass, None).unwrap();
+    assert_eq!(installed(&root).unwrap(), next.manifest);
+    assert!(run(&next, &root, pass, None).is_err());
 }
 
 #[test]
@@ -314,6 +369,93 @@ fn running_directory_blocks_update_without_any_replacement() {
     assert!(error.to_string().contains("停止并退出"));
     assert_eq!(before, read_program(&root));
     drop(lock);
+}
+
+#[test]
+fn unified_upgrade_never_opens_data_and_preserves_user_bytes_and_mtimes_on_resume() {
+    let root = fixture();
+    first(&root);
+    let names = [
+        "data/mysql/8.0/local/ibdata1",
+        "data/mysql/8.0/local/app/table.ibd",
+        "data/redis/dump.rdb",
+        "data/redis/appendonlydir/appendonly.aof",
+        "bin/mysql/package/instances/local/my.ini",
+        "bin/php/package/php.ini",
+        "bin/redis/package/redis.conf",
+        "config/custom.conf",
+        "www/site/index.php",
+        "logs/mysql.log",
+        "runtime/temp/session",
+    ];
+    let mut snapshots = Vec::new();
+    let mut handles = Vec::new();
+    for name in names {
+        let path = root.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, format!("isolated sentinel {name}")).unwrap();
+        snapshots.push((
+            path.clone(),
+            fs::read(&path).unwrap(),
+            fs::metadata(&path).unwrap().modified().unwrap(),
+        ));
+        if name.starts_with("data/") {
+            handles.push(
+                OpenOptions::new()
+                    .read(true)
+                    .share_mode(0)
+                    .open(path)
+                    .unwrap(),
+            );
+        }
+    }
+    let next = package("0.9.0", Mode::Unified);
+    assert!(run(&next, &root, pass, Some(1)).is_err());
+    assert!(run(&next, &root, fail, None).is_err());
+    run(&next, &root, pass, None).unwrap();
+    drop(handles);
+    for (path, bytes, modified) in snapshots {
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+    }
+}
+
+#[test]
+fn protected_paths_cannot_be_written_or_removed_even_by_a_manifest() {
+    let root = fixture();
+    first(&root);
+    let before = read_program(&root);
+    for name in [
+        "data/mysql/ibdata1",
+        "Data/mysql/ibdata1",
+        "bin/mysql/my.ini",
+        "config/app.json",
+        "www/index.php",
+        "logs/mysql.log",
+        "runtime/temp/session",
+        "licenses/../data/ibdata1",
+        "D:/data/ibdata1",
+        "licenses/../../escape",
+    ] {
+        let mut next = package("0.9.0", Mode::Unified);
+        next.manifest.remove.insert(name.into());
+        assert!(run(&next, &root, pass, None).is_err(), "{name}");
+        next.manifest.remove.clear();
+        next.manifest.files.insert(name.into(), 1);
+        assert!(run(&next, &root, pass, None).is_err(), "{name}");
+        assert!(
+            write_program(&root, &root.join(name), b"bad").is_err(),
+            "{name}"
+        );
+    }
+    assert_eq!(before, read_program(&root));
+    assert!(!root.join(ACTIVE).exists());
+    let unknown = fixture();
+    fs::write(unknown.join("keep.txt"), b"keep").unwrap();
+    assert!(run(&package("0.9.0", Mode::Unified), &unknown, pass, None).is_err());
+    fs::remove_file(root.join(INSTALLATION)).unwrap();
+    assert!(run(&package("0.9.0", Mode::Unified), &root, pass, None).is_err());
+    assert_eq!(before, read_program(&root));
 }
 
 fn run(

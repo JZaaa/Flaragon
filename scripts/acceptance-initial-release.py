@@ -27,7 +27,7 @@ def main():
     base = checked(ROOT / 'testwork' / 'initial-release' / uuid.uuid4().hex)
     base.mkdir(parents=True)
     setup = checked(release / f'Flaragon-Setup-{version}-x64.exe')
-    update = checked(release / f'Flaragon-Update-{version}-x64.exe')
+    update = setup if setup.read_bytes()[-17] == 3 else checked(release / f'Flaragon-Update-{version}-x64.exe')
     cli = checked(ROOT / 'target/x86_64-pc-windows-msvc/release/flaragon-cli.exe')
     results = []
 

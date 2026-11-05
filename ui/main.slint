@@ -139,6 +139,7 @@ export component MainWindow inherits Window {
     in-out property <int> filter: 0;
     in-out property <bool> busy: true;
     in property <string> status: "正在读取环境…";
+    in property <string> operation-status: "正在处理，请稍候…";
     in property <bool> failed: false;
     in property <string> environment;
     in property <string> summary;
@@ -332,6 +333,7 @@ export component MainWindow inherits Window {
                                     MenuItem { title: "停止"; enabled: !root.busy && service.can-stop; activated => { root.action("stop", service.id); } }
                                     MenuItem { title: "重启"; enabled: !root.busy && service.can-stop; activated => { root.action("restart", service.id); } }
                                     MenuItem { title: "重加载配置（Apache）"; enabled: !root.busy && service.id == "apache" && service.running; activated => { root.action("reload", service.id); } }
+                                    MenuItem { title: "批量切换关联项目 PHP"; enabled: !root.busy && service.module == "PHP"; activated => { root.action("switch-project-php", service.id); } }
                                     MenuSeparator { }
                                     MenuItem { title: "编辑配置"; enabled: !root.busy && !service.missing; activated => { root.action("config", service.id); } }
                                     MenuItem { title: "查看日志"; enabled: !root.busy; activated => { root.action("log", service.id); } }
@@ -454,6 +456,7 @@ export component MainWindow inherits Window {
                                 VerticalLayout { padding: 12px; spacing: 12px;
                                     HorizontalLayout { spacing: 12px;
                                         Text { text: php.name; color: #4d5c77; horizontal-stretch: 1; vertical-alignment: center; overflow: elide; }
+                                        Action { text: "切换关联项目"; width: 108px; enabled: !root.busy; clicked => { root.action("switch-project-php", php.id); } }
                                         Label { text: php.locked ? "运行中，停止后可修改" : ""; }
                                     }
                                     HorizontalLayout { height: 32px; spacing: 24px;
@@ -526,7 +529,7 @@ export component MainWindow inherits Window {
             }
             Rectangle { height: 56px; background: root.failed ? #fff1f1 : #edf1f8; border-radius: 7px;
                 VerticalLayout { padding: 10px; spacing: 4px;
-                    Text { text: root.busy ? "正在处理，请稍候…" : root.status; color: root.failed ? #b43c48 : #576780; font-size: 11px; overflow: elide; }
+                    Text { text: root.busy ? root.operation-status : root.status; color: root.failed ? #b43c48 : #576780; font-size: 11px; overflow: elide; }
                     Text { text: root.environment; color: #8e9aaf; font-size: 10px; overflow: elide; }
                 }
                 TouchArea { clicked => { if root.failed { root.action("error-detail", ""); } } }

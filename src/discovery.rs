@@ -275,6 +275,7 @@ fn essential_files(package: &Package) -> Result<()> {
     let paths: Vec<PathBuf> = match package.kind {
         Kind::Php => vec![package.directory.join("php-cgi.exe")],
         Kind::Apache => [
+            "autoindex",
             "proxy",
             "proxy_fcgi",
             "proxy_balancer",

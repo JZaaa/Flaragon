@@ -77,6 +77,7 @@ struct State {
     mysql_generation: u64,
     mysql_dirty: Option<std::time::Instant>,
     choice_target: Option<(String, i32)>,
+    php_switch_targets: Vec<String>,
     mysql_dialog: Option<MysqlAdoptWindow>,
 }
 impl State {
@@ -152,8 +153,33 @@ impl State {
         crate::ensure!(!self.pending, "正在处理上一项操作，请稍候");
         self.applying = matches!(
             &command,
-            Command::Apply(_) | Command::Settings(_) | Command::RemoveMissing(_)
+            Command::Apply(_)
+                | Command::Settings(_)
+                | Command::RemoveMissing(_)
+                | Command::SwitchPhp(..)
         );
+        let progress = match &command {
+            Command::SwitchPhp(..) => {
+                "正在批量切换项目 PHP：校验 → 按需启动目标 PHP → 重加载 Apache → 验证"
+            }
+            Command::Apply(_) => {
+                "正在保存项目：校验配置 → 按需启动 PHP → 重加载 Apache → 验证；无需再次保存或手动启动"
+            }
+            Command::SaveConfig(id, _, _) if id == "apache" => {
+                "正在校验并应用 Apache 配置；运行时自动重加载并验证"
+            }
+            Command::SaveConfig(id, _, _) => {
+                ui.set_operation_status(
+                    format!("正在校验并应用 {id}；仅重启该运行实例，相关请求可能短暂中断").into(),
+                );
+                ""
+            }
+            Command::Settings(_) => "正在校验并保存环境设置；运行中的服务保持运行",
+            _ => "正在处理，请稍候…",
+        };
+        if !progress.is_empty() {
+            ui.set_operation_status(progress.into());
+        }
         match self.tx.try_send(command) {
             Ok(()) => (),
             Err(mpsc::TrySendError::Full(_)) => crate::bail!("后台任务队列已满，请稍后重试"),
@@ -381,7 +407,7 @@ impl State {
                 .collect(),
         ));
         ui.set_php_options(model(
-            std::iter::once("使用默认 PHP".into())
+            std::iter::once("请选择 PHP 版本".into())
                 .chain(
                     draft
                         .config
@@ -437,7 +463,7 @@ impl State {
             c.php.iter().map(|p| label(s, &p.package).into()).collect(),
         ));
         ui.set_php_options(model(
-            std::iter::once("使用默认 PHP".into())
+            std::iter::once("请选择 PHP 版本".into())
                 .chain(c.php.iter().map(|p| label(s, &p.package).into()))
                 .collect(),
         ));
@@ -568,7 +594,7 @@ impl State {
         ui.set_project_id(p.map(|p| p.id.as_str()).unwrap_or("").into());
         ui.set_project_group(p.map(|p| p.group.as_str()).unwrap_or("").into());
         ui.set_project_virtual_host(p.is_some_and(|p| p.virtual_host));
-        ui.set_project_lan(p.is_some_and(|p| p.lan_access));
+        ui.set_project_lan(p.is_none_or(|p| p.lan_access));
         ui.set_project_listed(p.is_none_or(|p| p.listed));
         ui.set_project_domain(p.map(|p| p.domain.as_str()).unwrap_or("").into());
         ui.set_project_directory(
@@ -615,14 +641,72 @@ impl State {
             rows.set_row_data(index, row);
         }
     }
+    fn choose_project_php(&mut self, ui: &MainWindow, source: &str, remove: bool) -> Result<()> {
+        let snapshot = self.snapshot.as_ref().context("环境尚未加载")?;
+        let projects: Vec<_> = snapshot
+            .config
+            .projects
+            .iter()
+            .filter(|p| {
+                p.php
+                    .as_ref()
+                    .or(snapshot.config.default_php.as_ref())
+                    .is_some_and(|id| id == source)
+            })
+            .map(|p| p.label())
+            .collect();
+        crate::ensure!(!projects.is_empty(), "没有项目使用此 PHP 包");
+        self.php_switch_targets = snapshot
+            .config
+            .php
+            .iter()
+            .filter(|php| {
+                php.package != source
+                    && php.usage != ServiceUsage::Disabled
+                    && snapshot
+                        .packages
+                        .iter()
+                        .any(|p| p.kind == Kind::Php && p.id == php.package && p.error.is_none())
+            })
+            .map(|p| p.package.clone())
+            .collect();
+        crate::ensure!(
+            !self.php_switch_targets.is_empty(),
+            "没有其他可用 PHP 版本，请先添加组件并启用后重试"
+        );
+        ui.set_picker_title(format!("为 {} 个关联项目选择 PHP 版本", projects.len()).into());
+        ui.set_picker_options(model(
+            self.php_switch_targets
+                .iter()
+                .map(|id| label(snapshot, id).into())
+                .collect(),
+        ));
+        ui.set_picker_selected(0);
+        self.choice_target = Some((format!("php-switch:{source}"), i32::from(remove)));
+        ui.invoke_show_picker();
+        Ok(())
+    }
     fn action(&mut self, ui: &MainWindow, name: &str, id: &str) -> Result<()> {
         match name {
+            "switch-project-php" => {
+                self.choose_project_php(ui, id.trim_start_matches("php:"), false)?
+            }
             "remove-missing" => {
                 let s = self.snapshot.as_ref().context("环境尚未加载")?;
                 crate::ensure!(
                     s.rows.iter().any(|r| r.id == id && r.missing),
                     "请刷新列表，只能移除缺失组件"
                 );
+                if let Some(source) = id.strip_prefix("php:")
+                    && s.config.projects.iter().any(|p| {
+                        p.php
+                            .as_ref()
+                            .or(s.config.default_php.as_ref())
+                            .is_some_and(|p| p == source)
+                    })
+                {
+                    return self.choose_project_php(ui, source, true);
+                }
                 let candidate = s.config.without_service(id)?;
                 s.config.validate_settings_change(
                     &candidate,
@@ -803,10 +887,13 @@ impl State {
                         domain: ui.get_project_domain().trim().into(),
                         directory: PathBuf::from(ui.get_project_directory().trim()),
                         document_root: PathBuf::from(ui.get_project_docroot().trim()),
-                        php: c
-                            .php
-                            .get((ui.get_project_php() - 1) as usize)
-                            .map(|p| p.package.clone()),
+                        php: Some(
+                            c.php
+                                .get((ui.get_project_php() - 1) as usize)
+                                .context("请明确选择项目使用的 PHP 版本")?
+                                .package
+                                .clone(),
+                        ),
                         enabled: ui.get_project_enabled(),
                     };
                     if index >= 0 && (index as usize) < c.projects.len() {
@@ -921,6 +1008,7 @@ pub fn run() -> Result<()> {
         mysql_generation: 0,
         mysql_dirty: None,
         choice_target: None,
+        php_switch_targets: Vec::new(),
         mysql_dialog: None,
     }));
     let weak = ui.as_weak();
@@ -1065,6 +1153,19 @@ pub fn run() -> Result<()> {
         let Some((kind, index)) = state.choice_target.take() else {
             return;
         };
+        if let Some(source) = kind.strip_prefix("php-switch:") {
+            let result = (|| -> Result<()> {
+                let target = state.php_switch_targets.get(selected as usize).context("请选择有效 PHP 版本")?.clone();
+                let snapshot = state.snapshot.as_ref().context("环境尚未加载")?;
+                let projects = snapshot.config.projects.iter().filter(|p| p.php.as_ref().or(snapshot.config.default_php.as_ref()).is_some_and(|p| p == source)).map(|p| format!("{}（{}）", p.label(), p.id)).collect::<Vec<_>>().join("\n");
+                if confirm(&format!("将以下项目统一切换到 {}？\n\n{projects}\n\n运行网站将自动应用并验证；项目文件不修改。{}", label(snapshot, &target), if index == 1 { "成功后移除原缺失 PHP 记录。" } else { "原 PHP 包及目录入口保留。" })) {
+                    state.send(&ui, Command::SwitchPhp(source.to_owned(), target, index == 1))?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = result { state.fail(&ui, format!("{error:#}")); }
+            return;
+        }
         match kind.as_str() {
             "http-address" if !ui.get_apache_locked() => {
                 if let Some(address) = ui.get_address_options().row_data(selected as usize) {
@@ -1352,6 +1453,9 @@ pub fn run() -> Result<()> {
                             ui.set_busy(false);
                         }
                         s.populate(&ui, *snapshot, error.clone());
+                        if applied && let Some(error) = &error {
+                            show_error(error);
+                        }
                         if applied && error.is_none() && ui.get_page() != 0 {
                             let index = ui.get_project_index();
                             s.load_draft(&ui);

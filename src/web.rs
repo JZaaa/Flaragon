@@ -12,6 +12,9 @@ pub fn html(value: &str) -> String {
 }
 
 pub fn navigation(config: &Config) -> String {
+    navigation_with_packages(config, &[])
+}
+pub fn navigation_with_packages(config: &Config, packages: &[Package]) -> String {
     let mut cards = String::new();
     let local_only = config
         .http_address
@@ -22,7 +25,17 @@ pub fn navigation(config: &Config) -> String {
         .iter()
         .filter(|p| p.enabled && p.listed && (p.lan_access || local_only))
     {
-        cards.push_str(&format!("<a class=card href=\"/{}/\" data-group=\"{}\"><strong>{}</strong><span>{}</span><code>/{}/</code></a>", p.id, html(&p.group), html(p.label()), html(&p.group), p.id));
+        let id = p.php.as_ref().or(config.default_php.as_ref());
+        let php = id
+            .map(|id| {
+                packages
+                    .iter()
+                    .find(|package| package.kind == Kind::Php && &package.id == id)
+                    .map(|package| format!("PHP {} · {}", package.version, package.label()))
+                    .unwrap_or_else(|| format!("PHP · {id}（版本未识别）"))
+            })
+            .unwrap_or_else(|| "PHP 未选择".into());
+        cards.push_str(&format!("<a class=card href=\"/{}/\" data-group=\"{}\"><strong>{}</strong><span>{}</span><span class=php>{}</span><code>/{}/</code></a>", p.id, html(&p.group), html(p.label()), html(&p.group), html(&php), p.id));
     }
     format!(
         r##"<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Flaragon · 项目</title>
@@ -34,7 +47,7 @@ pub fn navigation(config: &Config) -> String {
 
 fn directory(path: &str, access: &str) -> String {
     format!(
-        "<Directory \"{path}\">\nOptions -Indexes +FollowSymLinks\nAllowOverride All\nRequire {access}\n</Directory>\n"
+        "<Directory \"{path}\">\nOptions +Indexes +FollowSymLinks\nAllowOverride All\nRequire {access}\n</Directory>\n"
     )
 }
 fn handler(php: &str) -> String {

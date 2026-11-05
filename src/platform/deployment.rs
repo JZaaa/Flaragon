@@ -222,79 +222,8 @@ pub fn ensure_files_free(root: &Path, names: impl Iterator<Item = String>) -> Re
 }
 
 pub fn choose_directory(initial: &Path) -> Result<Option<std::path::PathBuf>> {
-    use std::os::windows::ffi::OsStringExt;
-    use windows_sys::Win32::{System::Com::*, UI::Shell::*};
-    struct Apartment;
-    impl Drop for Apartment {
-        fn drop(&mut self) {
-            /* SAFETY: Balances this thread's successful initialization. */
-            unsafe {
-                CoUninitialize();
-            }
-        }
-    }
-    struct Pidl(*mut Common::ITEMIDLIST);
-    impl Drop for Pidl {
-        fn drop(&mut self) {
-            /* SAFETY: The shell allocated this PIDL with the COM allocator. */
-            unsafe {
-                CoTaskMemFree(self.0.cast());
-            }
-        }
-    }
     let boundary = std::env::var_os("FLARAGON_DEV_ROOT").map(std::path::PathBuf::from);
-    if let Some(path) = &boundary {
-        crate::config::reject_links(path)?;
-    }
-    let _ = initial;
-    // SAFETY: COM is initialized on this worker; PIDLs are owned, output buffers remain live.
-    unsafe {
-        ensure!(
-            CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) >= 0,
-            "无法初始化目录选择器"
-        );
-        let _apartment = Apartment;
-        let mut root = Pidl(std::ptr::null_mut());
-        if let Some(boundary) = boundary {
-            ensure!(
-                SHParseDisplayName(
-                    wide(&boundary).as_ptr(),
-                    std::ptr::null_mut(),
-                    &mut root.0,
-                    0,
-                    std::ptr::null_mut()
-                ) >= 0,
-                "无法打开目录范围"
-            );
-        }
-        let title = wide("选择 Flaragon 使用目录");
-        let mut display = [0u16; 260];
-        let info = BROWSEINFOW {
-            hwndOwner: std::ptr::null_mut(),
-            pidlRoot: root.0,
-            pszDisplayName: display.as_mut_ptr(),
-            lpszTitle: title.as_ptr(),
-            ulFlags: BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_EDITBOX,
-            lpfn: None,
-            lParam: 0,
-            iImage: 0,
-        };
-        let selected = Pidl(SHBrowseForFolderW(&info));
-        if selected.0.is_null() {
-            return Ok(None);
-        }
-        let mut path = vec![0u16; 32768];
-        ensure!(
-            SHGetPathFromIDListEx(
-                selected.0,
-                path.as_mut_ptr(),
-                path.len() as u32,
-                GPFIDL_DEFAULT
-            ) != 0,
-            "请选择本机目录"
-        );
-        let len = path.iter().position(|v| *v == 0).context("目录路径无效")?;
-        let path = std::path::PathBuf::from(std::ffi::OsString::from_wide(&path[..len]));
-        Ok(Some(crate::deployment::target_root(&path)?))
-    }
+    super::directory_dialog::choose(0, initial, boundary.as_deref(), "选择 Flaragon 使用目录")?
+        .map(|path| crate::deployment::target_root(&path))
+        .transpose()
 }

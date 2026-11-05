@@ -27,6 +27,11 @@ fn main() -> Result<()> {
             match action {
                 "scan" => engine.scan()?,
                 "remove_missing" => engine.remove_missing_service(id)?,
+                "switch_php" => engine.switch_project_php(
+                    id,
+                    value["target"].as_str().context("缺少 target")?,
+                    value["remove_missing"].as_bool().unwrap_or(false),
+                )?,
                 "mysql_directory" => {
                     let spec = engine
                         .config

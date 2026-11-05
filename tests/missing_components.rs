@@ -93,7 +93,7 @@ fn manual_removal_persists_and_preserves_files_and_other_missing_services() {
 }
 
 #[test]
-fn explicit_disabled_and_default_project_references_require_switching_first() {
+fn legacy_projects_are_pinned_and_all_references_require_explicit_switching() {
     let layout = fixture();
     let config = Config {
         default_php: Some("php-gone".into()),
@@ -130,6 +130,11 @@ fn explicit_disabled_and_default_project_references_require_switching_first() {
     let mut next = engine.config.clone();
     next.default_php = Some("php-other".into());
     engine.apply_settings(next).unwrap();
+    assert_eq!(engine.config.projects[1].php.as_deref(), Some("php-gone"));
+    assert!(engine.remove_missing_service("php:php-gone").is_err());
+    let mut next = engine.config.clone();
+    next.projects[1].php = Some("php-other".into());
+    engine.apply(next).unwrap();
     engine.remove_missing_service("php:php-gone").unwrap();
     assert_eq!(engine.config.projects.len(), 2);
     assert!(!engine.config.projects[0].enabled);

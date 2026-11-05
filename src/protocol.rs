@@ -6,10 +6,10 @@ use std::{
 };
 
 fn connect(port: u16) -> Result<TcpStream> {
-    let stream = TcpStream::connect_timeout(
-        &SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
-        Duration::from_secs(2),
-    )?;
+    connect_at(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+}
+fn connect_at(address: SocketAddr) -> Result<TcpStream> {
+    let stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))?;
     stream.set_read_timeout(Some(Duration::from_secs(4)))?;
     stream.set_write_timeout(Some(Duration::from_secs(4)))?;
     Ok(stream)
@@ -37,7 +37,14 @@ pub fn redis(port: u16, args: &[&str]) -> Result<String> {
     redis_authenticated(port, &[], args)
 }
 pub fn redis_authenticated(port: u16, password: &[u8], args: &[&str]) -> Result<String> {
-    let mut stream = connect(port)?;
+    redis_authenticated_at((Ipv4Addr::LOCALHOST, port).into(), password, args)
+}
+pub fn redis_authenticated_at(
+    address: SocketAddr,
+    password: &[u8],
+    args: &[&str],
+) -> Result<String> {
+    let mut stream = connect_at(address)?;
     if !password.is_empty() {
         redis_write(&mut stream, &[b"AUTH", password])?;
     }
@@ -114,7 +121,10 @@ fn redis_reply(reader: &mut impl BufRead, depth: usize) -> Result<Vec<u8>> {
     Ok(result)
 }
 pub fn mysql_greeting(port: u16) -> Result<String> {
-    let mut stream = connect(port)?;
+    mysql_greeting_at((Ipv4Addr::LOCALHOST, port).into())
+}
+pub fn mysql_greeting_at(address: SocketAddr) -> Result<String> {
+    let mut stream = connect_at(address)?;
     let mut header = [0u8; 4];
     stream.read_exact(&mut header)?;
     let len = header[0] as usize | ((header[1] as usize) << 8) | ((header[2] as usize) << 16);

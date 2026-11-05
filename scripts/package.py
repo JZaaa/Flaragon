@@ -1,4 +1,4 @@
-"""Build the two offline deployment EXEs from a strict, project-local payload allowlist."""
+"""Build one offline installer/updater from a strict, project-local payload allowlist."""
 from pathlib import Path
 import argparse
 import gzip
@@ -36,13 +36,16 @@ def upgrade_minimum(version, policy, changelog):
         return parts
 
     target = number(version)
-    if target < (0, 0, 4):
-        return policy['minimum_version']
+    minimum = policy['minimum_version']
+    if number(minimum) > target:
+        raise ValueError('Minimum supported version must not exceed the target release')
     published = re.findall(r'^# ([0-9]+\.[0-9]+\.[0-9]+)\s*$', changelog, re.MULTILINE)
-    older = [(number(value), value) for value in published if number(value) < target]
-    if not older:
-        raise ValueError('Previous published version is missing from CHANGELOG.md')
-    return max(older)[1]
+    if minimum != version and minimum not in published:
+        raise ValueError('Minimum supported version must be a published release')
+    for excluded in policy['excluded_versions']:
+        if not number(minimum) <= number(excluded) < target:
+            raise ValueError('Excluded release must be inside the upgrade range')
+    return minimum
 
 
 def build_payload(version, release_id):
@@ -86,7 +89,7 @@ def write_package(stub, payload, destination, mode):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--build-id', help='Explicitly requested same-version rebuild in a separate archive')
-    parser.add_argument('--same-version-base', type=Path, help='Explicit original archive accepted by the rebuilt Update')
+    parser.add_argument('--same-version-base', type=Path, help='Explicit original archive accepted by the rebuilt installer')
     args = parser.parse_args()
     if os.environ.get('FLARAGON_DEV_ROOT', '').lower() != str(ROOT).lower():
         raise ValueError('Run scripts/env.ps1 first')
@@ -99,12 +102,10 @@ def main():
             raise ValueError('Rebuild archive already exists; choose a new build identifier')
     else:
         output = checked(ROOT / 'dist' / version)
-    output.mkdir(parents=True, exist_ok=True)
-    manifest_path = checked(output / 'release.json')
-    previous = json.loads(manifest_path.read_text(encoding='utf-8')) if manifest_path.exists() else None
-    if previous and checked(output / 'update-base.json').exists():
-        raise ValueError('Bound update archive is fixed; create a separate build with an explicit baseline')
-    release_id = previous['release_id'] if previous else uuid.uuid4().hex
+        if output.exists():
+            raise ValueError('Release archive already exists; published packages cannot be overwritten')
+    output.mkdir(parents=True, exist_ok=False)
+    release_id = uuid.uuid4().hex
     manifest, files = build_payload(version, release_id)
     update_base = None
     if args.same_version_base:
@@ -112,7 +113,7 @@ def main():
             raise ValueError('Bound same-version update requires a separate build archive')
         base_dir = checked(args.same_version_base.absolute())
         update_base = json.loads(checked(base_dir / 'release.json').read_bytes())
-        for key in ('product', 'version', 'architecture', 'format', 'config_schema', 'minimum_version', 'excluded_versions'):
+        for key in ('product', 'version', 'architecture', 'format', 'config_schema'):
             if update_base[key] != manifest[key]:
                 raise ValueError(f'Same-version baseline mismatch: {key}')
         if update_base['release_id'] == release_id or manifest['remove'] or update_base['files'].keys() != manifest['files'].keys():
@@ -127,27 +128,24 @@ def main():
             raise ValueError('Staging directory contains unknown or obsolete files; choose a new release version')
     for name, data in files.items():
         path = checked(stage / name)
-        if previous and (not path.exists() or path.read_bytes() != data):
-            raise ValueError('Published version contents differ; use a new product version')
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
     subprocess.run([str(stage / 'Flaragon.exe'), '--deployment-check', version, str(stage)], check=True, timeout=25,
                    creationflags=subprocess.CREATE_NO_WINDOW)
     stub = checked(ROOT / 'target/x86_64-pc-windows-msvc/release/flaragon-deploy.exe').read_bytes()
     payload = archive(files)
-    for mode, kind in enumerate(('Setup', 'Update')):
-        path = checked(output / f'Flaragon-{kind}-{version}-x64.exe')
-        packed = payload
-        if mode == 1 and update_base:
-            base_bytes = json.dumps(update_base, ensure_ascii=False, indent=2).encode('utf-8')
-            checked(output / 'update-base.json').write_bytes(base_bytes)
-            packed = archive({**files, 'update-base.json': base_bytes})
-        write_package(stub, packed, path, mode)
-        print(path)
+    path = checked(output / f'Flaragon-Setup-{version}-x64.exe')
+    if update_base:
+        base_bytes = json.dumps(update_base, ensure_ascii=False, indent=2).encode('utf-8')
+        checked(output / 'update-base.json').write_bytes(base_bytes)
+        payload = archive({**files, 'update-base.json': base_bytes})
+    write_package(stub, payload, path, 3)
+    print(path)
     checked(output / 'release.json').write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
     checked(output / 'build-info.json').write_text(json.dumps({
         'version': version, 'target': manifest['architecture'], 'source': 'Cargo.lock and project release build',
         'components_included': False, 'file_count': len(files), 'signed': False,
+        'deployment_mode': 'Unified',
         'executable_bytes': len(files['Flaragon.exe']),
         'build_id': args.build_id,
         'release_id': release_id,

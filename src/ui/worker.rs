@@ -18,6 +18,7 @@ pub(super) enum Command {
     Restart(String),
     Reload(String),
     RemoveMissing(String),
+    SwitchPhp(String, String, bool),
     Apply(Config),
     Settings(Config),
     Startup(crate::startup::Settings),
@@ -270,6 +271,9 @@ pub(super) fn worker(layout: Layout, rx: Receiver<Command>, tx: SyncSender<Event
             Command::Restart(id) => engine.restart(&id),
             Command::Reload(id) => engine.reload(&id),
             Command::RemoveMissing(id) => engine.remove_missing_service(&id),
+            Command::SwitchPhp(source, target, remove) => {
+                engine.switch_project_php(&source, &target, remove)
+            }
             Command::Apply(config) => engine.apply(config),
             Command::Settings(config) => engine.apply_settings(config),
             Command::InspectMysql(..) => unreachable!(),

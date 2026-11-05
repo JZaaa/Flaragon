@@ -23,6 +23,7 @@ use windows_sys::Win32::{
 };
 
 pub mod deployment;
+mod directory_dialog;
 pub mod secrets;
 pub(crate) mod startup;
 
@@ -36,103 +37,18 @@ pub fn choose_directory(
     owner: isize,
     initial: &Path,
 ) -> Result<Option<PathBuf>> {
-    use std::os::windows::ffi::OsStringExt;
-    use windows_sys::Win32::{
-        System::Com::*,
-        UI::{Shell::*, WindowsAndMessaging::SendMessageW},
-    };
-    struct ComApartment;
-    impl Drop for ComApartment {
-        fn drop(&mut self) {
-            // SAFETY: This guard follows a successful CoInitializeEx on this thread.
-            unsafe {
-                CoUninitialize();
-            }
-        }
-    }
-    struct ItemList(*mut Common::ITEMIDLIST);
-    impl Drop for ItemList {
-        fn drop(&mut self) {
-            // SAFETY: Shell-allocated PIDLs use the COM task allocator; null is allowed.
-            unsafe {
-                CoTaskMemFree(self.0.cast());
-            }
-        }
-    }
-    unsafe extern "system" fn initialized(
-        window: HWND,
-        message: u32,
-        _: LPARAM,
-        data: LPARAM,
-    ) -> i32 {
-        if message == BFFM_INITIALIZED {
-            // SAFETY: data points to the initial UTF-16 path kept alive throughout the dialog.
-            unsafe {
-                SendMessageW(window, BFFM_SETSELECTIONW, 1, data);
-            }
-        }
-        0
-    }
     let initial = layout
         .site_path(initial)
         .ok()
         .filter(|p| p.is_dir())
         .unwrap_or_else(|| layout.root.clone());
-    let initial = wide(initial);
-    let title = wide("选择网站目录");
-    // SAFETY: COM and PIDLs are owned by the guards; all buffers outlive the modal call.
-    // The owner belongs to the live UI, which awaits the worker event without blocking.
-    unsafe {
-        let status = CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32);
-        ensure!(status >= 0, "无法初始化目录选择器：{status:#x}");
-        let _apartment = ComApartment;
-        let mut root = ItemList(std::ptr::null_mut());
-        if let Some(boundary) = layout.development_root() {
-            crate::config::reject_links(boundary)?;
-            let status = SHParseDisplayName(
-                wide(boundary).as_ptr(),
-                std::ptr::null_mut(),
-                &mut root.0,
-                0,
-                std::ptr::null_mut(),
-            );
-            ensure!(status >= 0, "无法打开开发隔离目录：{status:#x}");
-        }
-        let mut display = [0u16; 260];
-        let info = BROWSEINFOW {
-            hwndOwner: owner as HWND,
-            pidlRoot: root.0,
-            pszDisplayName: display.as_mut_ptr(),
-            lpszTitle: title.as_ptr(),
-            ulFlags: BIF_RETURNONLYFSDIRS
-                | BIF_NEWDIALOGSTYLE
-                | BIF_EDITBOX
-                | BIF_NONEWFOLDERBUTTON,
-            lpfn: Some(initialized),
-            lParam: initial.as_ptr() as LPARAM,
-            iImage: 0,
-        };
-        let selected = ItemList(SHBrowseForFolderW(&info));
-        if selected.0.is_null() {
-            return Ok(None);
-        }
-        let mut path = vec![0u16; 32768];
-        ensure!(
-            SHGetPathFromIDListEx(
-                selected.0,
-                path.as_mut_ptr(),
-                path.len() as u32,
-                GPFIDL_DEFAULT
-            ) != 0,
-            "请选择本机文件夹"
-        );
-        let length = path.iter().position(|c| *c == 0).context("目录路径无效")?;
-        let path = layout.site_path(PathBuf::from(std::ffi::OsString::from_wide(
-            &path[..length],
-        )))?;
-        ensure!(path.is_dir(), "目录不存在：{}", path.display());
-        Ok(Some(path))
-    }
+    directory_dialog::choose(owner, &initial, layout.development_root(), "选择网站目录")?
+        .map(|path| {
+            let path = layout.site_path(path)?;
+            ensure!(path.is_dir(), "目录不存在：{}", path.display());
+            Ok(path)
+        })
+        .transpose()
 }
 pub fn replace_file(from: &Path, to: &Path) -> Result<()> {
     let from = wide(from);
@@ -194,26 +110,30 @@ pub fn command(exe: &Path, root: &Path, cwd: &Path) -> Command {
     cmd
 }
 pub fn capture(cmd: &mut Command, timeout: Duration) -> Result<String> {
+    capture_bounded(cmd, timeout, 131072)
+}
+pub fn capture_bounded(cmd: &mut Command, timeout: Duration, limit: usize) -> Result<String> {
+    ensure!(limit <= 1024 * 1024, "组件输出上限不能超过 1 MiB");
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd
         .spawn()
         .context("无法启动组件（检查 x64 运行库与路径）")?;
     let out = child.stdout.take().context("缺少 stdout")?;
     let err = child.stderr.take().context("缺少 stderr")?;
-    fn drain(mut stream: impl Read) -> Vec<u8> {
+    fn drain(mut stream: impl Read, limit: usize) -> Vec<u8> {
         let mut kept = Vec::new();
         let mut buf = [0; 4096];
         while let Ok(n) = stream.read(&mut buf) {
             if n == 0 {
                 break;
             }
-            let take = n.min(131072usize.saturating_sub(kept.len()));
+            let take = n.min(limit.saturating_sub(kept.len()));
             kept.extend_from_slice(&buf[..take]);
         }
         kept
     }
-    let a = thread::spawn(move || drain(out));
-    let b = thread::spawn(move || drain(err));
+    let a = thread::spawn(move || drain(out, limit));
+    let b = thread::spawn(move || drain(err, limit));
     let start = Instant::now();
     let status = loop {
         if let Some(code) = child.try_wait()? {

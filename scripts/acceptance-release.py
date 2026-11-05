@@ -37,9 +37,11 @@ def main():
     assert expected.issubset(manifest['files'])
     assert all(name in expected or name.startswith('licenses/') for name in manifest['files'])
     setup = checked(release / f'Flaragon-Setup-{current}-x64.exe')
-    update = checked(release / f'Flaragon-Update-{current}-x64.exe')
+    unified = setup.read_bytes()[-17] == 3
+    update = setup if unified else checked(release / f'Flaragon-Update-{current}-x64.exe')
     old_release = checked(args.baseline_release.absolute()) if args.baseline_release else checked(ROOT / 'dist' / args.baseline)
     old_setup = checked(old_release / f'Flaragon-Setup-{args.baseline}-x64.exe')
+    baseline_manifest = json.loads(checked(old_release / 'release.json').read_bytes())
     old_update = checked(old_release / f'Flaragon-Update-{args.baseline}-x64.exe')
     cli = checked(ROOT / 'target/x86_64-pc-windows-msvc/release/flaragon-cli.exe')
     base = checked(ROOT / 'testwork' / ('release-' + current + '-' + uuid.uuid4().hex[:12]))
@@ -82,11 +84,11 @@ def main():
         payload = {name: checked(release / 'payload' / name).read_bytes()
                    for name in [*manifest['files'], 'release.json']}
         unbound = base / 'unbound-update.exe'
-        builder.write_package(stub, builder.archive(payload), unbound, 1)
+        builder.write_package(stub, builder.archive(payload), unbound, 3 if unified else 1)
         wrong_base = json.loads(checked(release / 'update-base.json').read_bytes())
         wrong_base['release_id'] = 'a' * 32
         wrong_bound = base / 'wrong-bound-update.exe'
-        builder.write_package(stub, builder.archive({**payload, 'update-base.json': json.dumps(wrong_base).encode()}), wrong_bound, 1)
+        builder.write_package(stub, builder.archive({**payload, 'update-base.json': json.dumps(wrong_base).encode()}), wrong_bound, 3 if unified else 1)
 
     fresh, old, independent, resume = [base / name for name in ['fresh install space', 'original', 'independent', 'resume']]
     call(setup, '--inspect', fresh)
@@ -140,10 +142,18 @@ def main():
         for repair in args.repair:
             call(checked(repair.absolute()), '--apply', repaired)
         targets.append(repaired)
+    legacy_config = dict(schema=1, revision=3, http_port=8080, apache=None,
+        default_php='legacy-php', php=[dict(package='legacy-php', port=19001, usage=True)],
+        mysql=[], redis=None, projects=[dict(id='legacy', directory='www/legacy', php=None)])
     for target in targets:
-        sentinels = {'config/app.json': json.dumps(response['snapshot']['config']).encode(),
+        sentinels = {'config/app.json': json.dumps(legacy_config).encode(),
             'config/startup.json': b'{"launch_at_login":false,"start_common_services":true}',
-            'data/mysql/keep.bin': b'isolated database fixture', 'www/keep.php': b'<?php echo 1;',
+            'data/mysql/8.0/local/ibdata1': b'isolated database fixture',
+            'data/mysql/8.0/local/app/table.ibd': b'isolated table fixture',
+            'data/redis/dump.rdb': b'isolated redis fixture',
+            'data/redis/appendonlydir/appendonly.aof': b'isolated aof fixture',
+            'www/keep.php': b'<?php echo 1;', 'logs/mysql.log': b'log fixture',
+            'bin/mysql/package/instances/local/my.ini': b'[mysqld]\nbind-address=0.0.0.0',
             'bin/php/keep.txt': b'component fixture', 'runtime/temp/keep.session': b'session fixture'}
         for name, data in sentinels.items():
             write(target, name, data)
@@ -173,7 +183,11 @@ def main():
     assert checked(unknown / 'keep.txt').read_bytes() == b'unknown target fixture'
     record('same-version upgrade, reinstall, unknown target and source directory rejected')
     token = uuid.uuid4().hex
-    journal = dict(format=1, token=token, mode='Update',
+    for name, data in sentinels.items():
+        write(resume, name, data)
+    resume_preserved = {name: (checked(resume / name).read_bytes(), checked(resume / name).stat().st_mtime_ns)
+                        for name in sentinels}
+    journal = dict(format=1, token=token, mode='Unified' if unified else 'Update',
         installation=json.loads(checked(resume / '.flaragon-install.json').read_bytes()),
         previous=json.loads(checked(resume / 'release.json').read_bytes()), next=manifest)
     for name in [*manifest['files'], 'release.json']:
@@ -188,6 +202,8 @@ def main():
         record('interrupted same-version update rejects absent or mismatched baseline binding')
     call(update, '--apply', resume)
     verify(resume)
+    assert all((checked(resume / name).read_bytes(), checked(resume / name).stat().st_mtime_ns) == value
+               for name, value in resume_preserved.items())
     assert not checked(resume / '.maintenance/active.json').exists()
     record('same release completes interrupted upgrade with main executable already replaced')
     for rejected in args.rejected_baseline:
@@ -198,11 +214,11 @@ def main():
         before = program(target)
         for action in ['--inspect', '--apply']:
             result = call(update, action, target, False)
-            assert '上一正式版本' in result['error'], result
+            assert '升级范围' in result['error'] or '上一正式版本' in result['error'], result
         assert before == program(target) and not checked(target / '.maintenance/active.json').exists()
-        record(f'non-predecessor {rejected} rejected before replacement')
+        record(f'unsupported source {rejected} rejected before replacement')
     evidence = dict(version=current, release=str(release), release_id=manifest['release_id'],
-        baseline=args.baseline, baseline_release=str(old_release),
+        baseline=args.baseline, baseline_release=str(old_release), baseline_release_id=baseline_manifest['release_id'],
         repairs=[str(checked(p.absolute())) for p in (args.repair or [])], fixture_root=str(base), checks=results,
         rejected_baselines=args.rejected_baseline,
         stopped=True, limits=['User files are independent sentinels; no database compatibility claim',

@@ -11,6 +11,7 @@ pub mod protocol;
 pub mod redis_config;
 pub mod relocation;
 pub mod service_config;
+pub mod service_network;
 pub mod startup;
 pub mod ui;
 pub mod web;

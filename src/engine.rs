@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    net::{Ipv4Addr, TcpListener},
+    net::{Ipv4Addr, SocketAddr, TcpListener},
     path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
@@ -34,6 +34,8 @@ struct Record {
     config: PathBuf,
     #[serde(default)]
     mysql_dual_loopback: bool,
+    #[serde(default)]
+    listeners: Vec<SocketAddr>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     redis_auth: Option<Vec<u8>>,
 }
@@ -43,6 +45,13 @@ struct Running {
 }
 impl Running {
     fn listening(&self) -> bool {
+        if !self.record.listeners.is_empty() {
+            return self
+                .record
+                .listeners
+                .iter()
+                .all(|address| self.process.owns_listener(*address).unwrap_or(false));
+        }
         self.record.ports.iter().all(|port| {
             if self.record.kind == Kind::Mysql {
                 mysql_network::listeners(*port, self.record.mysql_dual_loopback)
@@ -52,6 +61,19 @@ impl Running {
                 self.process.owns_port(*port).unwrap_or(false)
             }
         })
+    }
+    fn control_address(&self) -> Result<SocketAddr> {
+        let address = self
+            .record
+            .listeners
+            .first()
+            .copied()
+            .unwrap_or_else(|| (Ipv4Addr::LOCALHOST, self.record.ports[0]).into());
+        ensure!(
+            self.process.owns_listener(address)?,
+            "监听地址 {address} 不属于本实例，拒绝发送控制命令"
+        );
+        Ok(crate::service_network::control(address))
     }
 }
 #[derive(Serialize, Deserialize)]
@@ -155,6 +177,63 @@ impl Engine {
         self.message = "已移除缺失组件的服务记录；项目、配置文件和数据均保留".into();
         self.persist()
             .context("移除已保存，但运行状态记录更新失败")?;
+        Ok(())
+    }
+
+    pub fn switch_project_php(
+        &mut self,
+        source: &str,
+        target: &str,
+        remove_missing: bool,
+    ) -> Result<()> {
+        ensure!(source != target, "请选择另一个 PHP 包");
+        self.packages = discovery::scan_cached(&self.layout, &mut self.discovery_cache)?;
+        self.package(target, Kind::Php)?;
+        ensure!(
+            self.config.service_usage(&format!("php:{target}"))? != ServiceUsage::Disabled,
+            "目标 PHP 已停用，请先启用"
+        );
+        let source_id = format!("php:{source}");
+        self.config.service_package(&source_id)?;
+        if remove_missing {
+            ensure!(
+                self.missing_package(&self.config, &source_id),
+                "原 PHP 组件仍存在，请刷新列表后重试"
+            );
+            ensure!(
+                !self.running_ids().contains(&source_id),
+                "原 PHP 仍在运行，请先停止"
+            );
+        }
+        let mut candidate = self.config.clone();
+        let mut count = 0;
+        for project in &mut candidate.projects {
+            if project
+                .php
+                .as_ref()
+                .or(candidate.default_php.as_ref())
+                .is_some_and(|id| id == source)
+            {
+                project.php = Some(target.to_owned());
+                count += 1;
+            }
+        }
+        ensure!(count > 0, "没有项目使用此 PHP 包");
+        self.apply(candidate)?;
+        let applied_message = self.message.clone();
+        if remove_missing {
+            self.remove_missing_service(&source_id)
+                .context("项目已切换，但原 PHP 记录未移除，请检查状态后重试移除")?;
+        }
+        self.message = format!(
+            "已将 {count} 个项目切换到 {target}{}",
+            if remove_missing {
+                "，并移除原缺失 PHP 记录；项目文件保留"
+            } else {
+                ""
+            }
+        );
+        self.message.push_str(&format!("；{applied_message}"));
         Ok(())
     }
 
@@ -278,7 +357,13 @@ impl Engine {
             fs::read(&candidate)? == config_bytes,
             "检查后配置发生变化，请重新检查"
         );
-        mysql_network::preflight(spec.port, mysql_network::dual_loopback(&package.version)?)?;
+        self.preflight_database(
+            Kind::Mysql,
+            &package.executable,
+            &package.directory,
+            &candidate,
+            spec.port,
+        )?;
         let conf = self.commit_service_config(&format!("mysql:{}", spec.id), &candidate)?;
         let pending = self
             .layout
@@ -309,7 +394,7 @@ impl Engine {
                 conf,
             )?;
             ensure!(
-                crate::discovery::version(&protocol::mysql_greeting(spec.port)?) == package.version,
+                crate::discovery::version(&self.mysql_greeting(&id)?) == package.version,
                 "接入验证返回的 MySQL 版本不符"
             );
             self.stop_internal(&id)?;
@@ -676,7 +761,7 @@ impl Engine {
         )?;
         atomic_write(&file, text.as_bytes())?;
         let candidate = self.config.clone();
-        if let Err(e) = self.apply(candidate) {
+        if let Err(e) = self.apply_selected(candidate, Some(id)) {
             return match atomic_write(&file, &before) {
                 Ok(()) => Err(e.context("配置应用失败；编辑前文件已恢复")),
                 Err(restore) => Err(e.context(format!("配置应用失败；文件恢复失败：{restore:#}"))),
@@ -926,25 +1011,14 @@ impl Engine {
         ports: Vec<u16>,
         config: PathBuf,
     ) -> Result<()> {
-        let mysql_dual_loopback = if kind == Kind::Mysql {
-            let spec = self
-                .config
-                .mysql
-                .iter()
-                .find(|spec| id == format!("mysql:{}", spec.id))
-                .context("MySQL 服务不存在")?;
-            mysql_network::dual_loopback(&self.package(&spec.package, Kind::Mysql)?.version)?
+        let database_listeners = if matches!(kind, Kind::Mysql | Kind::Redis) {
+            self.preflight_database(kind, exe, cwd, &config, ports[0])?
         } else {
-            false
+            Vec::new()
         };
-        if kind == Kind::Mysql {
-            for port in &ports {
-                mysql_network::preflight(*port, mysql_dual_loopback)?;
-            }
-        }
         let listeners = if kind == Kind::Apache {
             self.config.http_listeners()?
-        } else if kind == Kind::Mysql {
+        } else if matches!(kind, Kind::Mysql | Kind::Redis) {
             vec![]
         } else {
             ports.iter().map(|p| (Ipv4Addr::LOCALHOST, *p)).collect()
@@ -981,7 +1055,8 @@ impl Engine {
             identity: process.identity.clone(),
             ports,
             config,
-            mysql_dual_loopback,
+            mysql_dual_loopback: false,
+            listeners: database_listeners,
             redis_auth,
         };
         self.running
@@ -1045,10 +1120,7 @@ impl Engine {
                         p.process.wait(Duration::from_secs(45))?;
                     }
                     Kind::Redis => {
-                        ensure!(
-                            p.process.owns_port(p.record.ports[0])?,
-                            "Redis 端口不属于本实例，拒绝关闭"
-                        );
+                        let address = p.control_address()?;
                         let password = p
                             .record
                             .redis_auth
@@ -1056,11 +1128,8 @@ impl Engine {
                             .map(platform::secrets::open)
                             .transpose()?
                             .unwrap_or_default();
-                        let response = protocol::redis_authenticated(
-                            p.record.ports[0],
-                            &password,
-                            &["SHUTDOWN"],
-                        );
+                        let response =
+                            protocol::redis_authenticated_at(address, &password, &["SHUTDOWN"]);
                         if let Err(e) = response
                             && p.process.running()
                         {
@@ -1107,7 +1176,7 @@ impl Engine {
     }
     pub fn restart(&mut self, id: &str) -> Result<()> {
         if id.starts_with("php:") && self.running.contains_key("apache") {
-            return self.apply(self.config.clone());
+            return self.apply_selected(self.config.clone(), Some(id));
         }
         self.stop(id)?;
         self.start(id)
@@ -1397,6 +1466,36 @@ impl Engine {
         }
         Ok(())
     }
+    fn mysql_greeting(&self, id: &str) -> Result<String> {
+        let running = self
+            .running
+            .get(id)
+            .and_then(|entries| entries.first())
+            .context("MySQL 未运行")?;
+        protocol::mysql_greeting_at(running.control_address()?)
+    }
+    fn preflight_database(
+        &self,
+        kind: Kind,
+        exe: &Path,
+        cwd: &Path,
+        config: &Path,
+        port: u16,
+    ) -> Result<Vec<SocketAddr>> {
+        let addresses = if kind == Kind::Mysql {
+            let mut cmd = platform::command(exe, &self.layout.root, cwd);
+            cmd.arg(format!("--defaults-file={}", config.display()))
+                .args(["--verbose", "--help"]);
+            let output = platform::capture_bounded(&mut cmd, Duration::from_secs(10), 1024 * 1024)?;
+            crate::service_network::mysql(&output, port)?
+                .into_iter()
+                .map(|address| (address, false))
+                .collect()
+        } else {
+            crate::service_network::redis(&fs::read_to_string(config)?, port)?
+        };
+        crate::service_network::preflight(&addresses)
+    }
     fn mysql_config(&self, spec: &MysqlSpec) -> Result<PathBuf> {
         let p = self.package(&spec.package, Kind::Mysql)?;
         let dir = spec.data_path(&self.layout)?;
@@ -1406,11 +1505,10 @@ impl Engine {
         );
         let out = self.generated()?.join(format!("mysql-{}.ini", spec.id));
         let mut text = format!(
-            "[mysqld]\nbasedir=\"{}\"\ndatadir=\"{}\"\nport={}\nbind-address={}\nlog-error=\"{}\"\npid-file=\"{}\"\ntmpdir=\"{}\"\nsecure-file-priv=NULL\nlocal-infile=0\n",
+            "[mysqld]\nbasedir=\"{}\"\ndatadir=\"{}\"\nport={}\nlog-error=\"{}\"\npid-file=\"{}\"\ntmpdir=\"{}\"\nsecure-file-priv=NULL\nlocal-infile=0\n",
             apache_path(&p.directory)?,
             apache_path(&dir)?,
             spec.port,
-            mysql_network::bind_address(&p.version)?,
             apache_path(&self.layout.path(format!("logs/{}-error.log", spec.id))?)?,
             apache_path(&self.layout.path(format!("runtime/state/{}.pid", spec.id))?)?,
             apache_path(&self.layout.path("runtime/temp")?)?
@@ -1471,8 +1569,14 @@ impl Engine {
             .context("MySQL 实例不存在")?
             .clone();
         let p = self.package(&spec.package, Kind::Mysql)?.clone();
-        mysql_network::preflight(spec.port, mysql_network::dual_loopback(&p.version)?)?;
         let candidate = self.mysql_config(&spec)?;
+        self.preflight_database(
+            Kind::Mysql,
+            &p.executable,
+            &p.directory,
+            &candidate,
+            spec.port,
+        )?;
         let conf = self.commit_service_config(&format!("mysql:{id}"), &candidate)?;
         let dir = spec.data_path(&self.layout)?;
         let marker = spec.binding_path(&self.layout)?;
@@ -1510,6 +1614,7 @@ impl Engine {
                         ports: vec![],
                         config: conf.clone(),
                         mysql_dual_loopback: false,
+                        listeners: Vec::new(),
                         redis_auth: None,
                     },
                     process,
@@ -1552,7 +1657,8 @@ impl Engine {
             conf,
         )?;
         ensure!(
-            protocol::mysql_greeting(spec.port)?.starts_with(&p.version),
+            self.mysql_greeting(&format!("mysql:{id}"))?
+                .starts_with(&p.version),
             "MySQL 实际版本不符"
         );
         Ok(())
@@ -1562,7 +1668,7 @@ impl Engine {
         let package = self.package(&spec.package, Kind::Redis)?;
         let out = self.generated()?.join("redis.conf");
         let text = format!(
-            "bind 127.0.0.1\nprotected-mode yes\nport {}\ndir \"{}\"\ndbfilename dump.rdb\nlogfile \"{}\"\n",
+            "port {}\ndir \"{}\"\ndbfilename dump.rdb\nlogfile \"{}\"\n",
             spec.port,
             apache_path(&self.layout.path("data/redis")?)?,
             apache_path(&self.layout.path("logs/redis-server.log")?)?
@@ -1605,10 +1711,7 @@ impl Engine {
                 .get("redis")
                 .and_then(|v| v.first())
                 .context("Redis 进程记录丢失")?;
-            ensure!(
-                process.process.owns_port(spec.port)?,
-                "Redis 监听者已变化，停止健康探测"
-            );
+            let address = process.control_address()?;
             let password = process
                 .record
                 .redis_auth
@@ -1616,7 +1719,7 @@ impl Engine {
                 .map(platform::secrets::open)
                 .transpose()?
                 .unwrap_or_default();
-            match protocol::redis_authenticated(spec.port, &password, &["PING"]) {
+            match protocol::redis_authenticated_at(address, &password, &["PING"]) {
                 Ok(response) if response.starts_with("+PONG") => break,
                 Err(error)
                     if error.to_string().contains("LOADING")
@@ -1659,6 +1762,7 @@ impl Engine {
             "authn_core",
             "access_compat",
             "dir",
+            "autoindex",
             "mime",
             "log_config",
             "alias",
@@ -1686,6 +1790,10 @@ impl Engine {
         let extra = fs::read_to_string(self.layout.path("config/overrides/apache.conf")?)?;
         let head = text;
         let text = crate::web::routes(&self.layout, &self.config, &dir, &self.token)?;
+        atomic_write(
+            &self.layout.path(dir.join("portal/index.html"))?,
+            crate::web::navigation_with_packages(&self.config, &self.packages).as_bytes(),
+        )?;
         let conf = service_config::prepare(
             &self.layout,
             &self.service_config_path("apache")?,
@@ -1822,175 +1930,234 @@ impl Engine {
         );
         Ok(())
     }
-    pub fn apply(&mut self, mut candidate: Config) -> Result<()> {
+    pub fn apply(&mut self, candidate: Config) -> Result<()> {
+        self.apply_selected(candidate, None)
+    }
+    fn apply_selected(&mut self, mut candidate: Config, selected: Option<&str>) -> Result<()> {
+        for project in &candidate.projects {
+            ensure!(
+                project.php.is_some(),
+                "项目 {} 必须明确选择 PHP 版本",
+                project.label()
+            );
+        }
         candidate.validate(&self.layout)?;
         self.validate_settings(&candidate)?;
-        candidate.revision = self
-            .config
-            .revision
-            .checked_add(1)
-            .context("配置版本号超出范围")?;
         let old = self.config.clone();
-        let old_token = self.token.clone();
-        let old_files = if self.has_running() {
-            self.applied_files.clone()
-        } else {
-            self.configuration_files()?
-        };
-        let old_applied = self.applied.clone();
-        let was_running = self.has_running();
-        let old_ids = self.running_ids();
-        let deferred = self
-            .service_ids_for(&candidate)
-            .into_iter()
-            .filter_map(|id| match self.deferred_config(&candidate, &id) {
-                Ok(true) => Some(Ok(id)),
-                Ok(false) => None,
-                Err(e) => Some(Err(e)),
-            })
-            .collect::<Result<BTreeSet<_>>>()?;
-        ensure!(
-            !old_ids.iter().any(|id| deferred.contains(id)),
-            "缺失组件关联的服务仍有运行记录，请先停止后再修改项目"
-        );
-        let candidate_token = platform::random_token()?;
-        self.config = candidate;
-        self.token = candidate_token;
-        let preflight = (|| {
-            self.ensure_overrides()?;
-            let candidates = self
-                .service_ids()
+        let mut without_projects = candidate.clone();
+        without_projects.projects = old.projects.clone();
+        without_projects.revision = old.revision;
+        let projects_only = serde_json::to_value(&without_projects)? == serde_json::to_value(&old)?;
+        candidate.revision = old.revision.checked_add(1).context("配置版本号超出范围")?;
+        let ids = if let Some(id) = selected {
+            vec![id.to_owned()]
+        } else if projects_only {
+            self.service_ids_for(&candidate)
                 .into_iter()
-                .filter(|id| !deferred.contains(id))
-                .map(|id| self.service_candidate(&id).map(|path| (id, path)))
-                .collect::<Result<Vec<_>>>()?;
+                .filter(|id| id == "apache")
+                .collect()
+        } else {
+            self.service_ids_for(&candidate)
+        };
+        let old_ids = self.running_ids();
+        let apache_running = old_ids.iter().any(|id| id == "apache");
+        if apache_running {
+            candidate.apache_dependencies()?;
+        }
+        let old_applied = self.applied.clone();
+        let old_snapshots = self.applied_files.clone();
+        let mut files = BTreeMap::new();
+        let mut deferred = BTreeSet::new();
+        for id in &ids {
+            if self.deferred_config(&candidate, id)? {
+                ensure!(
+                    !old_ids.contains(id),
+                    "缺失组件关联的服务仍在运行，请先停止后修改"
+                );
+                deferred.insert(id.clone());
+                continue;
+            }
+            for (path, disk) in service_config::snapshot(
+                &self.layout,
+                &self.service_config_path_for(&candidate, id)?,
+            )? {
+                let bytes = if old_ids.contains(id) {
+                    old_snapshots.get(&path).cloned().unwrap_or(disk)
+                } else {
+                    disk
+                };
+                files.insert(path, bytes);
+            }
+        }
+        self.config = candidate;
+        let prepared: Result<Vec<_>> = (|| {
+            self.ensure_overrides()?;
+            ids.iter()
+                .filter(|id| !deferred.contains(*id))
+                .map(|id| self.service_candidate(id).map(|path| (id.clone(), path)))
+                .collect()
+        })();
+        let prepared = match prepared {
+            Ok(value) => value,
+            Err(error) => {
+                self.config = old;
+                return Err(error.context("校验失败，未启停任何服务；请修正后重新保存"));
+            }
+        };
+        let changes: Result<Vec<_>> = prepared
+            .iter()
+            .filter(|(id, _)| old_ids.contains(id))
+            .map(|(id, path)| {
+                let active = self.service_config_path(id)?;
+                Ok((
+                    id.clone(),
+                    selected == Some(id.as_str()) || files.get(&active) != Some(&fs::read(path)?),
+                ))
+            })
+            .collect();
+        let changes = match changes {
+            Ok(changes) => changes,
+            Err(error) => {
+                self.config = old;
+                return Err(error);
+            }
+        };
+        let reload = changes
+            .iter()
+            .any(|(id, changed)| id == "apache" && *changed);
+        let restart: Vec<_> = changes
+            .into_iter()
+            .filter(|(id, changed)| id != "apache" && *changed)
+            .map(|(id, _)| id)
+            .collect();
+        let mut stopped = Vec::new();
+        let mut reload_attempted = false;
+        let result: Result<()> = (|| {
             atomic_write(
                 &self.layout.path("config/app.backup.json")?,
                 &serde_json::to_vec_pretty(&old)?,
             )?;
-            Ok(candidates)
-        })();
-        let candidates = match preflight {
-            Ok(candidates) => candidates,
-            Err(e) => {
-                self.config = old;
-                self.token = old_token;
-                return Err(e);
+            for id in &restart {
+                stopped.push(id.clone());
+                self.stop_internal(id)?;
             }
-        };
-        if was_running && let Err(e) = self.stop_all() {
-            self.config = old;
-            self.token = old_token;
-            self.applied = None;
-            self.persist()?;
-            return Err(e.context("部分服务未能停止；配置未应用，请检查各实例状态"));
-        }
-        let commit_result = (|| {
-            for (id, path) in &candidates {
+            for (id, path) in &prepared {
                 self.commit_service_config(id, path)?;
             }
-            self.layout.save(&self.config)
-        })();
-        if let Err(error) = commit_result {
-            self.config = old;
-            self.token = old_token;
-            let mut restore_errors = vec![];
-            for (path, bytes) in &old_files {
-                if let Err(e) = atomic_write(path, bytes) {
-                    restore_errors.push(e.to_string());
+            self.layout.save(&self.config)?;
+            for id in &restart {
+                self.start(id)?;
+            }
+            if apache_running {
+                for id in self.config.apache_dependencies()? {
+                    self.start(&id)?;
+                }
+                if reload {
+                    let active = self.service_config_path("apache")?;
+                    reload_attempted = true;
+                    self.reload_apache_bytes(&active, &fs::read(&active)?)?;
+                } else if restart.iter().any(|id| id.starts_with("php:")) {
+                    self.verify_sites()?;
                 }
             }
-            if was_running {
-                for id in &old_ids {
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let mut recovery_errors = Vec::new();
+            let cleanup: Vec<_> = self
+                .running_ids()
+                .into_iter()
+                .filter(|id| !old_ids.contains(id) || stopped.contains(id))
+                .collect();
+            for id in cleanup {
+                if let Err(e) = self.stop_internal(&id) {
+                    recovery_errors.push(format!("{id} 停止失败：{e:#}"));
+                }
+            }
+            self.config = old;
+            for (path, bytes) in &files {
+                if let Err(e) = atomic_write(path, bytes) {
+                    recovery_errors.push(e.to_string());
+                }
+            }
+            if let Err(e) = self.layout.save(&self.config) {
+                recovery_errors.push(e.to_string());
+            }
+            if recovery_errors.is_empty() {
+                for id in &stopped {
                     if let Err(e) = self.start(id) {
-                        restore_errors.push(e.to_string());
+                        recovery_errors.push(format!("{id} 恢复失败：{e:#}"));
+                    }
+                }
+                if reload_attempted {
+                    let active = self.service_config_path("apache")?;
+                    if let Some(bytes) = files.get(&active)
+                        && let Err(e) = self.reload_apache_bytes(&active, bytes)
+                    {
+                        recovery_errors.push(format!("Apache 恢复失败：{e:#}"));
                     }
                 }
             }
-            self.applied = if restore_errors.is_empty() {
+            self.applied = if recovery_errors.is_empty() {
                 old_applied
             } else {
                 None
             };
-            self.applied_files = old_files;
+            self.applied_files = old_snapshots;
             self.persist()?;
             bail!(
-                "保存配置失败：{error}；恢复结果：{}",
-                if restore_errors.is_empty() {
-                    "已恢复".into()
+                "保存应用失败：{error:#}；{}；编辑内容保留，请修正后重新保存",
+                if recovery_errors.is_empty() {
+                    "上一配置和运行状态已恢复".to_owned()
                 } else {
-                    restore_errors.join("；")
+                    recovery_errors.join("；")
                 }
             );
         }
-        if was_running {
-            let result: Result<()> = (|| {
-                for id in old_ids
-                    .iter()
-                    .filter(|id| self.service_ids().contains(id))
-                    .cloned()
-                    .collect::<Vec<_>>()
-                {
-                    self.start(&id)?;
-                }
-                Ok(())
-            })();
-            if let Err(e) = result {
-                let stopped = self.stop_all();
-                self.config = old;
-                self.token = old_token;
-                self.applied = None;
-                let mut errors = vec![];
-                if let Err(error) = self.layout.save(&self.config) {
-                    errors.push(error.to_string());
-                }
-                for (path, bytes) in &old_files {
-                    if let Err(error) = atomic_write(path, bytes) {
-                        errors.push(error.to_string());
-                    }
-                }
-                let restored = if stopped.is_ok() && errors.is_empty() {
-                    for id in old_ids {
-                        if let Err(e) = self.start(&id) {
-                            errors.push(e.to_string());
-                        }
-                    }
-                    if errors.is_empty() {
-                        "已恢复".into()
-                    } else {
-                        errors.join("；")
-                    }
-                } else {
-                    format!(
-                        "恢复待处理：{}；{}",
-                        stopped.err().map(|e| e.to_string()).unwrap_or_default(),
-                        errors.join("；")
-                    )
-                };
-                self.applied = if restored == "已恢复" {
-                    old_applied
-                } else {
-                    None
-                };
-                self.applied_files = old_files;
-                self.persist()?;
-                bail!("应用失败：{e}；上一配置：{restored}");
-            }
-            self.applied = deferred.is_empty().then(|| self.config.clone());
-            self.applied_files = self.configuration_files()?;
-            self.message = if deferred.is_empty() {
-                "配置已应用，运行结果已验证".into()
-            } else {
-                "设置已保存，原运行服务已恢复；缺失组件及相关网站配置尚未校验".into()
-            };
+        if apache_running && deferred.is_empty() {
+            self.applied = Some(self.config.clone());
         } else {
-            self.message = if deferred.is_empty() {
-                "完整配置已保存并完成预检查；启动后验证生效（Redis 语法由启动验证）".into()
-            } else {
-                "设置已保存；缺失组件及相关网站配置尚未校验，请切换项目 PHP 后移除缺失组件".into()
-            };
             self.applied = None;
         }
+        // Only verified services advance their running snapshots.
+        self.applied_files = old_snapshots;
+        for (id, _) in &prepared {
+            if old_ids.contains(id) {
+                self.applied_files.extend(service_config::snapshot(
+                    &self.layout,
+                    &self.service_config_path(id)?,
+                )?);
+            }
+        }
+        for id in self
+            .running_ids()
+            .into_iter()
+            .filter(|id| !old_ids.contains(id))
+        {
+            self.applied_files.extend(service_config::snapshot(
+                &self.layout,
+                &self.service_config_path(&id)?,
+            )?);
+        }
+        self.message = if !deferred.is_empty() {
+            "设置已保存；缺失组件关联配置尚未校验，其他服务保持运行".into()
+        } else if reload || !restart.is_empty() {
+            format!(
+                "保存并应用成功；{}{}；其他服务保持运行",
+                if reload {
+                    "Apache 已重加载并验证"
+                } else {
+                    ""
+                },
+                if restart.is_empty() {
+                    String::new()
+                } else {
+                    format!(" 已重启并验证：{}", restart.join("、"))
+                }
+            )
+        } else {
+            "配置已保存并完成预检查；已停止服务保持停止，启动后验证生效".into()
+        };
         self.persist()?;
         Ok(())
     }

@@ -94,7 +94,9 @@ fn run() -> Result<()> {
     let ui = DeployWindow::new()?;
     let about = std::rc::Rc::new(DeployAbout::new()?);
     ui.set_heading(
-        if package.mode == Mode::Install {
+        if package.mode == Mode::Unified {
+            "安装与升级 Flaragon"
+        } else if package.mode == Mode::Install {
             "安装 Flaragon"
         } else if package.mode == Mode::Repair {
             "修复 Flaragon"
@@ -104,7 +106,9 @@ fn run() -> Result<()> {
         .into(),
     );
     ui.set_operation(
-        if package.mode == Mode::Install {
+        if package.mode == Mode::Unified {
+            "开始安装或升级"
+        } else if package.mode == Mode::Install {
             "开始安装"
         } else if package.mode == Mode::Repair {
             "开始修复"
@@ -116,6 +120,8 @@ fn run() -> Result<()> {
     ui.set_version(package.manifest.version.clone().into());
     ui.set_status("请选择软件位置，然后点击“检查目录”。".into());
     let reviewed = Arc::new(Mutex::new(None::<deployment::Review>));
+    let reviewed_state = reviewed.clone();
+    let reviewed_package = package.clone();
     let (sender, receiver) = mpsc::sync_channel::<(String, std::result::Result<String, String>)>(2);
     let weak = ui.as_weak();
     ui.on_action(move |action| {
@@ -189,6 +195,11 @@ fn run() -> Result<()> {
                             ui.set_status("请点击“检查目录”核对目标位置。".into());
                         } else {
                             if action == "inspect" {
+                                if let Ok(review) = reviewed_state.lock()
+                                    && let Some(review) = review.as_ref()
+                                {
+                                    ui.set_operation(review.button_label(&reviewed_package).into());
+                                }
                                 ui.set_reviewed(true);
                             }
                             if action == "apply" {
